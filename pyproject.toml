@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparrow-st"
+version = "0.1.0"
+description = "Spatial Patterning and RNA-editing Regulation in Spatial Transcriptomics"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+keywords = [
+    "spatial transcriptomics",
+    "A-to-I RNA editing",
+    "graph neural network",
+    "spatial clustering",
+    "deconvolution"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Bio-Informatics"
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "scanpy",
+    "anndata",
+    "torch",
+    "POT",
+    "tqdm",
+    "matplotlib",
+    "seaborn",
+    "statsmodels"
+]
+
+[project.optional-dependencies]
+r = ["rpy2"]
+spatial_stats = ["libpysal", "esda"]
+dev = ["build", "twine", "pytest", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/yourname/SPARROW"
+Repository = "https://github.com/yourname/SPARROW"
+Issues = "https://github.com/yourname/SPARROW/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

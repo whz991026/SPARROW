@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+conda-meta/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and large outputs
+*.h5ad
+*.h5
+*.loom
+*.csv
+*.tsv
+*.xlsx
+*.rds
+*.RData
+*.bam
+*.bai
+*.fastq
+*.fq
+*.gz
+results/
+figures/
+outputs/
+logs/
