@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -38,6 +39,9 @@ from scipy import sparse
 from scipy.stats import kruskal, spearmanr, pearsonr
 from statsmodels.stats.multitest import multipletests
 from matplotlib.patches import Patch
+
+
+_SPATIAL_IMAGE_CACHE = {}
 
 
 # =============================================================================
@@ -79,6 +83,119 @@ def _coords_from_adata(adata) -> np.ndarray:
         "No spatial coordinates found. Need adata.obsm['spatial'] "
         "or obs columns such as x_pixel/y_pixel."
     )
+
+
+def set_spatial_background(
+    adata,
+    image_path: str,
+    swap_x_y: bool = False,
+    coordinate_scale: float = 1.0,
+    crop: bool = True,
+    crop_pad: float = 120,
+    image_alpha: float = 0.78,
+    crop_quantile: Tuple[float, float] = (0.5, 99.5),
+):
+    """
+    Store H&E background settings used by all spatial plotting helpers.
+
+    swap_x_y:
+        Swap spot x/y coordinates before plotting. Useful when image and
+        tissue_positions coordinates are transposed for a sample.
+
+    coordinate_scale:
+        Multiply spatial coordinates before plotting. For 10x hires images,
+        this is usually scalefactors_json['tissue_hires_scalef'].
+
+    crop:
+        Show only the image region covered by spots, padded by crop_pad pixels.
+    """
+    image_path = str(image_path)
+
+    if not Path(image_path).exists():
+        warnings.warn(f"Spatial background image not found: {image_path}")
+
+    adata.uns["spatial_background"] = {
+        "image_path": image_path,
+        "swap_x_y": bool(swap_x_y),
+        "coordinate_scale": float(coordinate_scale),
+        "crop": bool(crop),
+        "crop_pad": float(crop_pad),
+        "image_alpha": float(image_alpha),
+        "crop_quantile": tuple(crop_quantile),
+    }
+
+    return adata
+
+
+def _spatial_plot_config(adata) -> dict:
+    cfg = adata.uns.get("spatial_background", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _plot_coords_from_adata(adata) -> np.ndarray:
+    coords = _coords_from_adata(adata).astype(float, copy=True)
+    cfg = _spatial_plot_config(adata)
+
+    coords *= float(cfg.get("coordinate_scale", 1.0))
+
+    if cfg.get("swap_x_y", False):
+        coords = coords[:, [1, 0]]
+
+    return coords
+
+
+def _load_spatial_image(image_path: str):
+    image_path = str(image_path)
+
+    if image_path not in _SPATIAL_IMAGE_CACHE:
+        _SPATIAL_IMAGE_CACHE[image_path] = plt.imread(image_path)
+
+    return _SPATIAL_IMAGE_CACHE[image_path]
+
+
+def _draw_spatial_background(ax, adata, x, y) -> bool:
+    cfg = _spatial_plot_config(adata)
+    image_path = cfg.get("image_path")
+
+    if not image_path:
+        return False
+
+    if not Path(image_path).exists():
+        warnings.warn(f"Spatial background image not found: {image_path}")
+        return False
+
+    img = _load_spatial_image(image_path)
+    height, width = img.shape[:2]
+
+    ax.imshow(
+        img,
+        extent=(0, width, height, 0),
+        origin="upper",
+        alpha=cfg.get("image_alpha", 0.78),
+        zorder=0,
+    )
+
+    finite = np.isfinite(x) & np.isfinite(y)
+
+    if cfg.get("crop", True) and finite.any():
+        q_low, q_high = cfg.get("crop_quantile", (0.5, 99.5))
+        pad = float(cfg.get("crop_pad", 120))
+
+        xmin, xmax = np.nanpercentile(x[finite], [q_low, q_high])
+        ymin, ymax = np.nanpercentile(y[finite], [q_low, q_high])
+
+        xmin = max(0, xmin - pad)
+        xmax = min(width, xmax + pad)
+        ymin = max(0, ymin - pad)
+        ymax = min(height, ymax + pad)
+
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymax, ymin)
+    else:
+        ax.set_xlim(0, width)
+        ax.set_ylim(height, 0)
+
+    return True
 
 
 def _zscore_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -745,26 +862,29 @@ def _spatial_axes(
     clip=(1, 99),
     center=None,
 ):
-    coords = _coords_from_adata(adata)
+    coords = _plot_coords_from_adata(adata)
 
     x = coords[:, 0]
     y = coords[:, 1]
 
     values = np.asarray(values, dtype=float)
     mask = np.isfinite(values)
+    has_background = _draw_spatial_background(ax, adata, x, y)
 
     ax.scatter(
         x[~mask],
         y[~mask],
         s=spot_size,
         c="#d9d9d9",
-        alpha=0.22,
+        alpha=0.38 if has_background else 0.22,
         linewidths=0,
+        zorder=2,
     )
 
     if mask.sum() == 0:
         ax.set_title(title)
-        ax.invert_yaxis()
+        if not has_background:
+            ax.invert_yaxis()
         ax.set_aspect("equal")
         ax.axis("off")
         return None
@@ -785,10 +905,12 @@ def _spatial_axes(
         vmin=vmin,
         vmax=vmax,
         linewidths=0,
+        zorder=3,
     )
 
     ax.set_title(title, fontsize=11, pad=8)
-    ax.invert_yaxis()
+    if not has_background:
+        ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.axis("off")
 
