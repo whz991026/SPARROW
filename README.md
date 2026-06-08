@@ -9,13 +9,13 @@ SPARROW is a Python package for spatial transcriptomics analysis, including spat
 Install directly from GitHub:
 
 ```bash
-pip install git+https://github.com/yourname/SPARROW.git
+pip install git+https://github.com/whz991026/SPARROW.git
 ```
 
 For development:
 
 ```bash
-git clone https://github.com/yourname/SPARROW.git
+git clone https://github.com/whz991026/SPARROW.git
 cd SPARROW
 pip install -e .
 ```
@@ -27,39 +27,39 @@ import scanpy as sc
 from sparrow import SPARROW
 from sparrow import clustering
 
-adata = sc.read_h5ad("spatial_data.h5ad")
+adata = sc.read\_h5ad("spatial\_data.h5ad")
 
 model = SPARROW(
     adata=adata,
-    use_gene=True,
-    use_ai=False,
+    use\_gene=True,
+    use\_ai=False,
     epochs=600,
 )
 
 adata = model.train()
-adata = clustering(adata, n_clusters=7)
+adata = clustering(adata, n\_clusters=7)
 ```
 
 ## A-to-I RNA editing analysis
 
 ```python
-from sparrow import filter_atoi_sites, detect_spatial_atoi_sites, compute_spatial_atoi_score
+from sparrow import filter\_atoi\_sites, detect\_spatial\_atoi\_sites, compute\_spatial\_atoi\_score
 
-adata_ai_filtered, keep_mask = filter_atoi_sites(
-    adata_ai,
-    min_spot_cov=10,
-    min_n_spots=10,
+adata\_ai\_filtered, keep\_mask = filter\_atoi\_sites(
+    adata\_ai,
+    min\_spot\_cov=10,
+    min\_n\_spots=10,
 )
 
-sv_atoi = detect_spatial_atoi_sites(
-    adata_ai_filtered,
-    group_adata=adata,
-    group_key="domain",
+sv\_atoi = detect\_spatial\_atoi\_sites(
+    adata\_ai\_filtered,
+    group\_adata=adata,
+    group\_key="domain",
 )
 
-score = compute_spatial_atoi_score(
-    adata_ai_filtered,
-    sv_atoi,
+score = compute\_spatial\_atoi\_score(
+    adata\_ai\_filtered,
+    sv\_atoi,
 )
 ```
 
@@ -93,7 +93,7 @@ SPARROW/
 ├── .gitignore
 ├── src/
 │   └── sparrow/
-│       ├── __init__.py
+│       ├── \_\_init\_\_.py
 │       ├── sparrow.py
 │       ├── model.py
 │       ├── preprocess.py
@@ -105,3 +105,4 @@ SPARROW/
 ## Citation
 
 Coming soon.
+

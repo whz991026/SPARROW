@@ -1,2043 +1,3106 @@
-"""Spatial A-to-I editing analysis utilities.
-
-This module provides helpers for A-to-I site filtering, spatially variable
-A-to-I discovery, deconvolution association analysis, ADAR-family analyses,
-and publication-style visualization.
-"""
+# =============================================================================
+# atoi.py
+# Clean spatial A-to-I analysis utilities
+#
+# Workflow:
+# 1. Reliable A-to-I site filtering
+# 2. Compute global A-to-I score
+# 3. Plot global A-to-I spatial pattern
+# 4. Detect SV-A-to-I sites
+# 5. Plot top SV-A-to-I single-site patterns
+# 6. Add and plot ADAR-family spatial patterns
+# 7. Analyze ADAR-family spatial correlation
+# 8. Analyze global A-to-I vs ADAR-family expression
+# 9. Bivariate co-localization
+# 10. Analyze global A-to-I vs deconvolved cell types
+# 11. Joint model: global A-to-I ~ cell types + ADAR + spatial covariates
+# 12. Residual progression
+# 13. Site-level ADAR correlation
+# 14. Top site-ADAR co-localization examples
+#
+# Note:
+# Deconvolution cell-type merging should be done in notebook before calling
+# functions in this file.
+# =============================================================================
 
 from __future__ import annotations
 
 import warnings
+from typing import Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import statsmodels.api as sm
+
 from scipy import sparse
-from scipy.stats import kruskal, mannwhitneyu, norm, spearmanr
-from sklearn.neighbors import NearestNeighbors
+from scipy.stats import kruskal, spearmanr, pearsonr
 from statsmodels.stats.multitest import multipletests
+from matplotlib.patches import Patch
 
-def filter_atoi_sites(adata_ai, min_spot_cov=10, min_n_spots=10, max_site_ratio=1, copy=True, verbose=True):
-    """Filter A-to-I sites by site-level editing ratio and the number of sufficiently covered spots.
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-min_spot_cov : object
-    Spot-level coverage threshold used to count valid spots per site.
-min_n_spots : object
-    Minimum number of valid spots required to keep a site.
-max_site_ratio : object
-    Maximum allowed site-level G/(A+G) ratio.
-copy : object
-    Whether to return a copied AnnData object instead of a view.
-verbose : object
-    Whether to print progress and filtering summaries.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if 'A' not in adata_ai.layers:
-        raise ValueError("adata_ai.layers['A'] not found")
-    if 'G' not in adata_ai.layers:
-        raise ValueError("adata_ai.layers['G'] not found")
-    A = adata_ai.layers['A']
-    G = adata_ai.layers['G']
-    if sparse.issparse(A):
-        A = A.tocsr()
-    if sparse.issparse(G):
-        G = G.tocsr()
-    cov = A + G
-    site_A = np.asarray(A.sum(axis=0)).ravel()
-    site_G = np.asarray(G.sum(axis=0)).ravel()
-    site_cov = site_A + site_G
-    site_ratio = np.full(site_G.shape, np.nan, dtype=float)
-    mask_cov = site_cov > 0
-    site_ratio[mask_cov] = site_G[mask_cov] / site_cov[mask_cov]
-    adata_ai.var['total_A'] = site_A
-    adata_ai.var['total_G'] = site_G
-    adata_ai.var['total_cov'] = site_cov
-    adata_ai.var['site_G_ratio'] = site_ratio
-    n_spots_cov_gt = np.asarray((cov > min_spot_cov).sum(axis=0)).ravel()
-    cov_col = f'n_spots_cov_gt{min_spot_cov}'
-    adata_ai.var[cov_col] = n_spots_cov_gt
-    keep_mask = (adata_ai.var['site_G_ratio'] < max_site_ratio) & ~adata_ai.var['site_G_ratio'].isna() & (adata_ai.var[cov_col] >= min_n_spots)
-    if verbose:
-        print(f'Before: {adata_ai.n_vars}')
-        print(f'After : {int(keep_mask.sum())}')
-        print(f'Removed: {int((~keep_mask).sum())}')
-        print('')
-        print('Filtering criteria:')
-        print(f'  site_G_ratio < {max_site_ratio}')
-        print(f'  site_G_ratio is not NaN')
-        print(f'  {cov_col} >= {min_n_spots}')
-    if copy:
-        adata_filtered = adata_ai[:, keep_mask].copy()
-    else:
-        adata_filtered = adata_ai[:, keep_mask]
-    return (adata_filtered, keep_mask)
-
-def plot_spatial_value(adata, values, title, spot_size=18, cmap='magma', percentile_clip=(1, 99)):
-    """Plot a numeric spot-level value on tissue coordinates.
-
-Parameters
-----------
-adata : object
-    AnnData object containing spatial coordinates and observations.
-values : object
-    Numeric values to plot or aggregate.
-title : object
-    Plot title.
-spot_size : object
-    Marker size for spatial plots.
-cmap : object
-    Matplotlib or seaborn colormap name/object.
-percentile_clip : object
-    Lower and upper percentiles used to clip plotted values.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    x = adata.obs['x_pixel'].values
-    y = adata.obs['y_pixel'].values
-    values = np.asarray(values, dtype=float)
-    mask = ~np.isnan(values)
-    vmin = np.nanpercentile(values[mask], percentile_clip[0])
-    vmax = np.nanpercentile(values[mask], percentile_clip[1])
-    plt.figure(figsize=(5, 5))
-    plt.scatter(x[~mask], y[~mask], s=spot_size, c='lightgrey', alpha=0.15, linewidths=0)
-    sc = plt.scatter(x[mask], y[mask], s=spot_size, c=values[mask], cmap=cmap, vmin=vmin, vmax=vmax, linewidths=0)
-    plt.gca().invert_yaxis()
-    plt.gca().set_aspect('equal')
-    plt.axis('off')
-    plt.title(title)
-    plt.colorbar(sc, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    plt.show()
-
-def run_all_sites_deconv_quasibinomial(adata_ai, df_deconv, celltype_cols, reference_celltype='Mix', min_cov=10, min_valid_spots=30, min_total_A=20, min_total_G=20, min_ratio_sd=0.03, add_log_cov=True, standardize=True, max_abs_coef=20, verbose=True):
-    """Fit quasi-binomial GLMs for all A-to-I sites against deconvolved cell-type proportions.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-reference_celltype : object
-    Reference cell type excluded from the regression design matrix.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-min_valid_spots : object
-    Minimum number of complete or valid spots required for analysis.
-min_total_A : object
-    Minimum total A counts among valid spots for each site.
-min_total_G : object
-    Minimum total G counts among valid spots for each site.
-min_ratio_sd : object
-    Minimum standard deviation of editing ratio required for each site.
-add_log_cov : object
-    Whether to include log10 coverage as a covariate.
-standardize : object
-    Whether to z-score numeric predictors before fitting models.
-max_abs_coef : object
-    Maximum absolute logit coefficient used when reporting capped odds ratios.
-verbose : object
-    Whether to print progress and filtering summaries.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    common = adata_ai.obs_names.intersection(df_deconv.index)
-    if verbose:
-        print('adata_ai spots:', adata_ai.n_obs)
-        print('df_deconv spots:', df_deconv.shape[0])
-        print('common spots:', len(common))
-    if len(common) == 0:
-        raise ValueError('No common spots.')
-    adata_use = adata_ai[common].copy()
-    df_use = df_deconv.loc[common].copy()
-    use_celltypes = [c for c in celltype_cols if c != reference_celltype]
-    A = adata_use.layers['A']
-    G = adata_use.layers['G']
-    if sparse.issparse(A):
-        A = A.tocsr()
-    if sparse.issparse(G):
-        G = G.tocsr()
-    X_base = df_use[use_celltypes].astype(float).copy()
-    keep_predictors = []
-    for c in use_celltypes:
-        if X_base[c].std() > 1e-08:
-            keep_predictors.append(c)
-    if verbose:
-        dropped = sorted(set(use_celltypes) - set(keep_predictors))
-        if dropped:
-            print('Dropped near-zero predictors:', dropped)
-    use_celltypes = keep_predictors
-    X_base = X_base[use_celltypes]
-    results = []
-    for j in range(adata_use.n_vars):
-        site = adata_use.var_names[j]
-        gene = ''
-        if 'Gene.refGene' in adata_use.var.columns:
-            gene = adata_use.var.iloc[j]['Gene.refGene']
-        a = np.asarray(A[:, j].todense()).ravel() if sparse.issparse(A) else np.asarray(A[:, j]).ravel()
-        g = np.asarray(G[:, j].todense()).ravel() if sparse.issparse(G) else np.asarray(G[:, j]).ravel()
-        cov = a + g
-        valid = cov >= min_cov
-        if valid.sum() < min_valid_spots:
-            continue
-        total_A = float(a[valid].sum())
-        total_G = float(g[valid].sum())
-        if total_A < min_total_A or total_G < min_total_G:
-            continue
-        raw_ratio = np.full_like(g, np.nan, dtype=float)
-        raw_ratio[valid] = g[valid] / cov[valid]
-        if np.nanstd(raw_ratio[valid]) < min_ratio_sd:
-            continue
-        df_model = X_base.copy()
-        df_model['A'] = a
-        df_model['G'] = g
-        df_model['cov'] = cov
-        df_model['ratio_smooth'] = (df_model['G'] + 0.5) / (df_model['cov'] + 1.0)
-        df_model['ratio_raw'] = df_model['G'] / np.maximum(df_model['cov'], 1)
-        if add_log_cov:
-            df_model['log_cov'] = np.log10(df_model['cov'] + 1)
-        df_model = df_model.loc[valid].replace([np.inf, -np.inf], np.nan).dropna()
-        if df_model.shape[0] < min_valid_spots:
-            continue
-        x_cols = use_celltypes.copy()
-        if add_log_cov:
-            x_cols.append('log_cov')
-        X = df_model[x_cols].astype(float).copy()
-        if standardize:
-            for c in x_cols:
-                sd = X[c].std()
-                if sd > 0:
-                    X[c] = (X[c] - X[c].mean()) / sd
-                else:
-                    X[c] = 0.0
-        X = sm.add_constant(X, has_constant='add')
-        y = df_model['ratio_smooth'].astype(float)
-        weights = df_model['cov'].astype(float)
-        try:
-            fit = sm.GLM(y, X, family=sm.families.Binomial(), freq_weights=weights).fit(maxiter=100, disp=0)
-            pearson_chi2 = fit.pearson_chi2
-            df_resid = max(fit.df_resid, 1)
-            phi = max(1.0, pearson_chi2 / df_resid)
-            params = fit.params
-            bse = fit.bse * np.sqrt(phi)
-            zvals = params / bse
-            pvals = 2 * norm.sf(np.abs(zvals))
-            condition_number = np.linalg.cond(X.values)
-        except Exception as e:
-            if verbose:
-                print(f'[SKIP] {site}: {e}')
-            continue
-        for term in params.index:
-            coef = float(params[term])
-            se = float(bse[term])
-            pval = float(pvals[params.index.get_loc(term)])
-            if coef > max_abs_coef:
-                odds_ratio = np.exp(max_abs_coef)
-                flagged_extreme = True
-            elif coef < -max_abs_coef:
-                odds_ratio = np.exp(-max_abs_coef)
-                flagged_extreme = True
-            else:
-                odds_ratio = float(np.exp(coef))
-                flagged_extreme = False
-            results.append({'site': site, 'gene': gene, 'term': term, 'coef_logit': coef, 'se_quasi': se, 'z_quasi': float(zvals[term]), 'odds_ratio_capped': odds_ratio, 'pval': max(pval, np.nextafter(0, 1)), 'n_valid_spots': int(df_model.shape[0]), 'total_A_valid': total_A, 'total_G_valid': total_G, 'total_cov_valid': float(df_model['cov'].sum()), 'mean_ratio_raw': float(df_model['ratio_raw'].mean()), 'mean_ratio_smooth': float(df_model['ratio_smooth'].mean()), 'sd_ratio_raw': float(df_model['ratio_raw'].std()), 'mean_cov': float(df_model['cov'].mean()), 'phi_overdispersion': float(phi), 'condition_number': float(condition_number), 'flag_extreme_coef': flagged_extreme, 'model_type': 'quasi_binomial_glm', 'reference_celltype': reference_celltype})
-        if verbose and (j + 1) % 500 == 0:
-            print(f'Processed {j + 1}/{adata_use.n_vars} sites')
-    res = pd.DataFrame(results)
-    if res.empty:
-        return res
-    res['padj'] = np.nan
-    for term in res['term'].unique():
-        idx = res['term'] == term
-        res.loc[idx, 'padj'] = multipletests(res.loc[idx, 'pval'], method='fdr_bh')[1]
-    res['signed_score'] = np.sign(res['coef_logit']) * -np.log10(res['padj'].clip(lower=1e-300))
-    res = res.sort_values(['padj', 'pval']).reset_index(drop=True)
-    return res
+# =============================================================================
+# Basic helpers
+# =============================================================================
 
 def _as_csr(x):
-    """Convert sparse matrices to CSR format while leaving dense arrays unchanged.
-
-Parameters
-----------
-x : object
-    Matrix or array-like object.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
     return x.tocsr() if sparse.issparse(x) else x
 
-def _get_count_layers(adata_ai, a_layer='A', g_layer='G'):
-    """Retrieve A and G count layers from an AnnData object.
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
+def _get_count_layers(adata_ai, a_layer: str = "A", g_layer: str = "G"):
     if a_layer not in adata_ai.layers:
-        raise ValueError(f'adata_ai.layers[{a_layer!r}] not found')
+        raise ValueError(f"adata_ai.layers[{a_layer!r}] not found")
     if g_layer not in adata_ai.layers:
-        raise ValueError(f'adata_ai.layers[{g_layer!r}] not found')
-    return (_as_csr(adata_ai.layers[a_layer]), _as_csr(adata_ai.layers[g_layer]))
+        raise ValueError(f"adata_ai.layers[{g_layer!r}] not found")
 
-def _dense_col(x, j):
-    """Extract one matrix column as a one-dimensional dense NumPy array.
+    return _as_csr(adata_ai.layers[a_layer]), _as_csr(adata_ai.layers[g_layer])
 
-Parameters
-----------
-x : object
-    Matrix or array-like object.
-j : object
-    Column index.
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
+def _dense_col(x, j: int) -> np.ndarray:
     if sparse.issparse(x):
         return np.asarray(x[:, j].toarray()).ravel()
     return np.asarray(x[:, j]).ravel()
 
-def _coords_from_adata(adata):
-    """Extract spatial coordinates from `.obsm["spatial"]` or common coordinate columns in `.obs`.
 
-Parameters
-----------
-adata : object
-    AnnData object containing spatial coordinates and observations.
+def _dense_sum(x, axis: int) -> np.ndarray:
+    return np.asarray(x.sum(axis=axis)).ravel()
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if 'spatial' in adata.obsm:
-        return np.asarray(adata.obsm['spatial'], dtype=float)
-    for cols in (('x_pixel', 'y_pixel'), ('array_col', 'array_row'), ('x', 'y')):
+
+def _coords_from_adata(adata) -> np.ndarray:
+    if "spatial" in adata.obsm:
+        return np.asarray(adata.obsm["spatial"], dtype=float)
+
+    for cols in (("x_pixel", "y_pixel"), ("array_col", "array_row"), ("x", "y")):
         if set(cols).issubset(adata.obs.columns):
             return adata.obs.loc[:, list(cols)].to_numpy(dtype=float)
-    raise ValueError("No spatial coordinates found in adata.obsm['spatial'] or obs x/y columns.")
 
-def _site_ratio_matrix(adata_ai, site_idx, min_cov=10, a_layer='A', g_layer='G'):
-    """Build spot-by-site editing ratio and coverage matrices for selected sites.
+    raise ValueError(
+        "No spatial coordinates found. Need adata.obsm['spatial'] "
+        "or obs columns such as x_pixel/y_pixel."
+    )
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-site_idx : object
-    Integer indices of A-to-I sites to extract.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
+def _zscore_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.astype(float).copy()
+
+    for col in out.columns:
+        sd = out[col].std()
+        if np.isfinite(sd) and sd > 0:
+            out[col] = (out[col] - out[col].mean()) / sd
+        else:
+            out[col] = 0.0
+
+    return out
+
+
+def _safe_multipletest(pvals, method="fdr_bh"):
+    p = pd.Series(pvals).astype(float).fillna(1.0)
+    p = p.clip(lower=np.nextafter(0, 1), upper=1.0)
+    return multipletests(p.values, method=method)[1]
+
+
+def _safe_corr(x, y, method="spearman"):
+    df = pd.DataFrame({"x": x, "y": y}).replace([np.inf, -np.inf], np.nan).dropna()
+
+    if df.shape[0] < 3:
+        return np.nan, np.nan, int(df.shape[0])
+
+    if df["x"].std() == 0 or df["y"].std() == 0:
+        return np.nan, np.nan, int(df.shape[0])
+
+    method = str(method).lower()
+
+    if method == "spearman":
+        rho, pval = spearmanr(df["x"], df["y"])
+    elif method == "pearson":
+        rho, pval = pearsonr(df["x"], df["y"])
+    else:
+        raise ValueError("method must be 'spearman' or 'pearson'.")
+
+    return float(rho), float(pval), int(df.shape[0])
+
+
+def _valid_group_series(adata, group_key="ground_truth", index=None):
+    """
+    Return group labels while keeping missing labels as NaN.
+
+    This prevents NaN / 'nan' / 'None' from becoming fake clusters.
+    """
+    if group_key not in adata.obs.columns:
+        raise ValueError(f"{group_key!r} not found in adata.obs")
+
+    if index is None:
+        s = adata.obs[group_key].copy()
+    else:
+        s = adata.obs.loc[index, group_key].copy()
+
+    s = pd.Series(s, index=s.index, name=group_key)
+
+    s_str = s.astype(str).str.strip().str.lower()
+    bad = s.isna() | s_str.isin(["nan", "none", "na", "null", ""])
+
+    s = s.astype(object)
+    s.loc[bad] = np.nan
+
+    return s
+
+
+def _map_group_mean_to_spots(values, labels):
+    """
+    Map group-level mean values back to each spot.
+    Missing group labels remain NaN.
+    """
+    values = pd.Series(values, index=labels.index, dtype=float)
+    df = pd.DataFrame({"value": values, "group": labels}).dropna()
+
+    out = pd.Series(np.nan, index=labels.index, dtype=float)
+
+    if df.empty:
+        return out.values
+
+    group_mean = df.groupby("group", observed=True)["value"].mean()
+
+    valid = labels.notna()
+    out.loc[valid] = labels.loc[valid].map(group_mean).astype(float)
+
+    return out.values
+
+
+def _aggregate_analysis_frame_by_group(
+    adata_ai,
+    df_extra: Optional[pd.DataFrame] = None,
+    columns: Sequence[str] = (),
+    group_key: str = "ground_truth",
+    aggfunc: str = "mean",
+):
+    """
+    Build a group-level analysis frame and a spot-to-group label vector.
+
+    The returned frame is indexed by valid group labels. Numeric columns from
+    adata_ai.obs and df_extra are aggregated within each group.
+    """
+    if group_key not in adata_ai.obs.columns:
+        raise ValueError(f"{group_key!r} not found in adata_ai.obs")
+
+    aggfunc = str(aggfunc).lower()
+
+    if aggfunc not in ["mean", "median"]:
+        raise ValueError("aggfunc must be 'mean' or 'median'.")
+
+    labels = _valid_group_series(adata_ai, group_key=group_key)
+    common = adata_ai.obs_names
+
+    if df_extra is not None:
+        common = common.intersection(df_extra.index)
+
+    columns = list(dict.fromkeys(columns))
+
+    df = pd.DataFrame({"group": labels.loc[common]}, index=common)
+
+    obs_cols = [c for c in columns if c in adata_ai.obs.columns]
+    extra_cols = [
+        c for c in columns
+        if df_extra is not None and c in df_extra.columns and c not in obs_cols
+    ]
+
+    if obs_cols:
+        df = df.join(adata_ai.obs.loc[common, obs_cols], how="left")
+
+    if extra_cols:
+        df = df.join(df_extra.loc[common, extra_cols], how="left")
+
+    value_cols = [c for c in columns if c in df.columns]
+    df = df.dropna(subset=["group"])
+
+    for col in value_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if not value_cols:
+        return pd.DataFrame(index=pd.Index([], name=group_key)), labels
+
+    if aggfunc == "mean":
+        out = df.groupby("group", observed=True)[value_cols].mean()
+    else:
+        out = df.groupby("group", observed=True)[value_cols].median()
+
+    out.index.name = group_key
+
+    return out, labels
+
+
+def collapse_deconvolution_to_clusters(
+    adata_ai,
+    df_deconv: pd.DataFrame,
+    celltype_cols: Optional[Sequence[str]] = None,
+    group_key: str = "ground_truth",
+    aggfunc: str = "mean",
+    normalize: bool = True,
+    min_spots_per_group: int = 2,
+):
+    """
+    Aggregate spot-level deconvolution proportions to cluster-level proportions.
+
+    Returns:
+        cluster_deconv: group x celltype table
+        spot_deconv_cluster: cluster means mapped back to each spot
+        group_counts: number of spots contributing to each group
+    """
+    if celltype_cols is None:
+        celltype_cols = [
+            c for c in df_deconv.columns
+            if pd.api.types.is_numeric_dtype(df_deconv[c])
+        ]
+
+    celltype_cols = [c for c in celltype_cols if c in df_deconv.columns]
+
+    if not celltype_cols:
+        raise ValueError("No numeric cell-type columns found in df_deconv.")
+
+    cluster_df, labels = _aggregate_analysis_frame_by_group(
+        adata_ai=adata_ai,
+        df_extra=df_deconv,
+        columns=celltype_cols,
+        group_key=group_key,
+        aggfunc=aggfunc,
+    )
+
+    common = adata_ai.obs_names.intersection(df_deconv.index)
+    group_counts = (
+        pd.DataFrame({"group": labels.loc[common]}, index=common)
+        .dropna()
+        .groupby("group", observed=True)
+        .size()
+    )
+
+    keep_groups = group_counts[group_counts >= min_spots_per_group].index
+    cluster_df = cluster_df.loc[cluster_df.index.intersection(keep_groups)].copy()
+    group_counts = group_counts.loc[cluster_df.index]
+
+    if normalize and not cluster_df.empty:
+        row_sum = cluster_df.sum(axis=1).replace(0, np.nan)
+        cluster_df = cluster_df.div(row_sum, axis=0)
+
+    spot_df = pd.DataFrame(np.nan, index=adata_ai.obs_names, columns=celltype_cols, dtype=float)
+    valid = labels.notna() & labels.isin(cluster_df.index)
+
+    if valid.any():
+        spot_df.loc[valid, celltype_cols] = cluster_df.reindex(labels.loc[valid].values).values
+
+    return cluster_df, spot_df, group_counts
+
+
+def transfer_obs_metadata(
+    source_adata,
+    target_adata,
+    columns=("x_pixel", "y_pixel", "x_array", "y_array", "in_tissue", "ground_truth"),
+):
+    """
+    Copy selected obs columns and spatial coordinates from expression AnnData
+    to A-to-I AnnData.
+    """
+    common = target_adata.obs_names.intersection(source_adata.obs_names)
+
+    for col in columns:
+        if col in source_adata.obs.columns:
+            target_adata.obs[col] = np.nan
+            target_adata.obs.loc[common, col] = source_adata.obs.loc[common, col].values
+
+    if "spatial" in source_adata.obsm:
+        target_adata.obsm["spatial"] = np.zeros((target_adata.n_obs, 2), dtype=float)
+        tgt_idx = target_adata.obs_names.get_indexer(common)
+        src_idx = source_adata.obs_names.get_indexer(common)
+        target_adata.obsm["spatial"][tgt_idx, :] = np.asarray(source_adata.obsm["spatial"])[src_idx, :]
+
+    elif {"x_pixel", "y_pixel"}.issubset(target_adata.obs.columns):
+        target_adata.obs[["x_pixel", "y_pixel"]] = (
+            target_adata.obs[["x_pixel", "y_pixel"]]
+            .astype(float)
+            .fillna(0)
+        )
+        target_adata.obsm["spatial"] = target_adata.obs[["x_pixel", "y_pixel"]].values
+
+    return target_adata
+
+
+# =============================================================================
+# 1. Reliable A-to-I site filtering
+# =============================================================================
+
+def filter_atoi_sites(
+    adata_ai,
+    min_spot_cov: int = 10,
+    min_n_spots: int = 10,
+    min_site_ratio: Optional[float] = None,
+    max_site_ratio: float = 1.0,
+    min_site_ratio_sd: Optional[float] = None,
+    a_layer: str = "A",
+    g_layer: str = "G",
+    copy: bool = True,
+    verbose: bool = True,
+):
+    """
+    Filter reliable A-to-I sites.
+
+    Main criteria:
+        site_G_ratio is not NaN
+        site_G_ratio < max_site_ratio
+        n_spots_cov_gt{min_spot_cov} >= min_n_spots
+
+    Optional:
+        site_G_ratio > min_site_ratio
+        site_G_ratio_sd >= min_site_ratio_sd
+    """
     A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
+    cov = A + G
+
+    site_A = _dense_sum(A, axis=0)
+    site_G = _dense_sum(G, axis=0)
+    site_cov = site_A + site_G
+
+    site_ratio = np.full(adata_ai.n_vars, np.nan, dtype=float)
+    nonzero = site_cov > 0
+    site_ratio[nonzero] = site_G[nonzero] / site_cov[nonzero]
+
+    n_spots_cov = np.asarray((cov >= min_spot_cov).sum(axis=0)).ravel()
+    cov_col = f"n_spots_cov_gt{min_spot_cov}"
+
+    ratio_sd = np.full(adata_ai.n_vars, np.nan, dtype=float)
+
+    for j in range(adata_ai.n_vars):
+        a = _dense_col(A, j)
+        g = _dense_col(G, j)
+        c = a + g
+        valid = c >= min_spot_cov
+
+        if valid.sum() >= 2:
+            ratio_sd[j] = np.nanstd(g[valid] / c[valid])
+
+    adata_ai.var["total_A"] = site_A
+    adata_ai.var["total_G"] = site_G
+    adata_ai.var["total_cov"] = site_cov
+    adata_ai.var["site_G_ratio"] = site_ratio
+    adata_ai.var["site_G_ratio_sd"] = ratio_sd
+    adata_ai.var[cov_col] = n_spots_cov
+
+    keep = adata_ai.var["site_G_ratio"].notna()
+    keep &= adata_ai.var["site_G_ratio"] < max_site_ratio
+    keep &= adata_ai.var[cov_col] >= min_n_spots
+
+    if min_site_ratio is not None:
+        keep &= adata_ai.var["site_G_ratio"] > min_site_ratio
+
+    if min_site_ratio_sd is not None:
+        keep &= adata_ai.var["site_G_ratio_sd"] >= min_site_ratio_sd
+
+    if verbose:
+        print(f"Before: {adata_ai.n_vars}")
+        print(f"After : {int(keep.sum())}")
+        print(f"Removed: {int((~keep).sum())}")
+        print("\nFiltering criteria:")
+        print("  site_G_ratio is not NaN")
+        if min_site_ratio is not None:
+            print(f"  site_G_ratio > {min_site_ratio}")
+        print(f"  site_G_ratio < {max_site_ratio}")
+        print(f"  {cov_col} >= {min_n_spots}")
+        if min_site_ratio_sd is not None:
+            print(f"  site_G_ratio_sd >= {min_site_ratio_sd}")
+
+    adata_out = adata_ai[:, keep.values].copy() if copy else adata_ai[:, keep.values]
+
+    return adata_out, keep
+
+
+# =============================================================================
+# 2. Multi-site A-to-I scores
+# =============================================================================
+
+def _site_ratio_matrix(
+    adata_ai,
+    site_idx: Sequence[int],
+    min_cov: int = 10,
+    a_layer: str = "A",
+    g_layer: str = "G",
+):
+    A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
+
     ratios = []
     coverages = []
+
     for j in site_idx:
         a = _dense_col(A, j)
         g = _dense_col(G, j)
         cov = a + g
+
         ratio = np.full(adata_ai.n_obs, np.nan, dtype=float)
         valid = cov >= min_cov
         ratio[valid] = g[valid] / cov[valid]
+
         ratios.append(ratio)
         coverages.append(cov)
-    return (np.vstack(ratios).T, np.vstack(coverages).T)
 
-def _safe_moran_geary(values, coords, spatial_k=6):
-    """Compute Moran's I and Geary's C with graceful failure handling.
+    return np.vstack(ratios).T, np.vstack(coverages).T
 
-Parameters
-----------
-values : object
-    Numeric values to plot or aggregate.
-coords : object
-    Function argument used by this helper.
-spatial_k : object
-    Number of nearest neighbors used for spatial autocorrelation statistics.
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    mask = np.isfinite(values)
-    if mask.sum() <= spatial_k + 2 or np.nanstd(values[mask]) == 0:
-        return (np.nan, np.nan, np.nan, np.nan)
-    try:
-        from libpysal.weights import KNN
-        from esda.geary import Geary
-        from esda.moran import Moran
-        w = KNN.from_array(coords[mask], k=min(spatial_k, mask.sum() - 1))
-        w.transform = 'R'
-        moran = Moran(values[mask], w, permutations=999)
-        geary = Geary(values[mask], w, permutations=999)
-        return (float(moran.I), float(moran.p_sim), float(geary.C), float(geary.p_sim))
-    except Exception as exc:
-        warnings.warn(f'Moran/Geary failed; returning NaN spatial statistics: {exc}')
-        return (np.nan, np.nan, np.nan, np.nan)
+def _resolve_site_list(
+    adata_ai,
+    sites: Optional[Union[pd.DataFrame, Iterable[str]]] = None,
+    top_n: Optional[int] = None,
+    require_sv: bool = False,
+    weight_col: Optional[str] = None,
+):
+    weights = None
 
-def detect_spatial_atoi_sites(adata_ai, group_adata=None, group_key=None, min_cov=10, min_valid_spots=30, min_total_A=30, min_total_G=30, min_ratio_sd=0.03, spatial_k=6, fdr_cutoff=0.05, a_layer='A', g_layer='G', store_key='sv_atoi_sites', verbose=True):
-    """Detect spatially variable A-to-I sites using QC filters and spatial autocorrelation.
+    if sites is None:
+        site_names = list(adata_ai.var_names)
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-group_adata : object
-    Optional AnnData object containing group labels aligned by barcode.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-min_valid_spots : object
-    Minimum number of complete or valid spots required for analysis.
-min_total_A : object
-    Minimum total A counts among valid spots for each site.
-min_total_G : object
-    Minimum total G counts among valid spots for each site.
-min_ratio_sd : object
-    Minimum standard deviation of editing ratio required for each site.
-spatial_k : object
-    Number of nearest neighbors used for spatial autocorrelation statistics.
-fdr_cutoff : object
-    FDR threshold used to call significant SV-A-to-I sites.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
-verbose : object
-    Whether to print progress and filtering summaries.
+    elif isinstance(sites, pd.DataFrame):
+        df = sites.copy()
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if group_adata is not None:
-        common = adata_ai.obs_names.intersection(group_adata.obs_names)
-        adata_use = adata_ai[common].copy()
-        groups = group_adata.obs.loc[common, group_key] if group_key else None
-    else:
-        adata_use = adata_ai
-        groups = adata_use.obs[group_key] if group_key else None
-    coords = _coords_from_adata(adata_use)
-    A, G = _get_count_layers(adata_use, a_layer=a_layer, g_layer=g_layer)
-    results = []
-    for j, site in enumerate(adata_use.var_names):
-        a = _dense_col(A, j)
-        g = _dense_col(G, j)
-        cov = a + g
-        valid = cov >= min_cov
-        total_A = float(a[valid].sum())
-        total_G = float(g[valid].sum())
-        ratio = np.full(adata_use.n_obs, np.nan, dtype=float)
-        ratio[valid] = g[valid] / cov[valid]
-        n_valid = int(valid.sum())
-        sd_ratio = float(np.nanstd(ratio))
-        mean_ratio = float(np.nanmean(ratio)) if n_valid else np.nan
-        pass_qc = n_valid >= min_valid_spots and total_A >= min_total_A and (total_G >= min_total_G) and (sd_ratio >= min_ratio_sd)
-        moran_i = moran_p = geary_c = geary_p = np.nan
-        kw_stat = kw_p = np.nan
-        n_groups = 0
-        if pass_qc:
-            moran_i, moran_p, geary_c, geary_p = _safe_moran_geary(ratio, coords, spatial_k=spatial_k)
-            if groups is not None:
-                df = pd.DataFrame({'ratio': ratio, 'group': pd.Categorical(groups)}, index=adata_use.obs_names)
-                vals = [x['ratio'].dropna().values for _, x in df.groupby('group', observed=True)]
-                vals = [x for x in vals if len(x) >= 3]
-                n_groups = len(vals)
-                if n_groups >= 2:
-                    try:
-                        kw_stat, kw_p = kruskal(*vals)
-                        kw_stat, kw_p = (float(kw_stat), float(kw_p))
-                    except Exception:
-                        kw_stat = kw_p = np.nan
-        gene = adata_use.var.iloc[j].get('Gene.refGene', '')
-        results.append({'site': site, 'gene': gene, 'n_valid_spots': n_valid, 'total_A_valid': total_A, 'total_G_valid': total_G, 'total_cov_valid': total_A + total_G, 'mean_ratio': mean_ratio, 'sd_ratio': sd_ratio, 'pass_qc': bool(pass_qc), 'moran_I': moran_i, 'moran_p': moran_p, 'geary_C': geary_c, 'geary_p': geary_p, 'group_key': group_key, 'group_n': n_groups, 'group_kw_stat': kw_stat, 'group_kw_p': kw_p})
-        if verbose and (j + 1) % 500 == 0:
-            print(f'Processed {j + 1}/{adata_use.n_vars} A-to-I sites')
-    res = pd.DataFrame(results)
-    res['moran_fdr'] = np.nan
-    res['group_kw_fdr'] = np.nan
-    qc = res['pass_qc'].values
-    if qc.any():
-        p = res.loc[qc, 'moran_p'].fillna(1.0).values
-        res.loc[qc, 'moran_fdr'] = multipletests(p, method='fdr_bh')[1]
-        p_group = res.loc[qc, 'group_kw_p'].fillna(1.0).values
-        res.loc[qc, 'group_kw_fdr'] = multipletests(p_group, method='fdr_bh')[1]
-    res['is_sv_atoi'] = res['pass_qc'] & (res['moran_fdr'] < fdr_cutoff) & (res['moran_I'] > 0)
-    res = res.sort_values(['is_sv_atoi', 'moran_fdr', 'moran_I'], ascending=[False, True, False])
-    adata_ai.uns[store_key] = res
-    if verbose:
-        print(f"QC-passing sites: {int(res['pass_qc'].sum())}")
-        print(f"SV-A-to-I sites (Moran FDR < {fdr_cutoff}): {int(res['is_sv_atoi'].sum())}")
-    return res
+        if require_sv:
+            if "is_sv_atoi" not in df.columns:
+                raise ValueError("require_sv=True but sites DataFrame has no 'is_sv_atoi' column.")
 
-def compute_spatial_atoi_score(adata_ai, sv_sites, score_name='sv_atoi_score', min_cov=10, top_n=None, weight_col='moran_I', a_layer='A', g_layer='G', zscore_sites=True):
-    """Compute a spot-level multi-site A-to-I score from SV-A-to-I sites.
+            df = df[df["is_sv_atoi"] == True].copy()
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-sv_sites : object
-    SV-A-to-I site table or iterable of site names.
-score_name : object
-    Name of the output spot-level score column in `adata_ai.obs`.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-top_n : object
-    Maximum number of top-ranked sites or entries to use.
-weight_col : object
-    Column used as site weights when computing a multi-site score.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
-zscore_sites : object
-    Whether to z-score each site before aggregating into a score.
+            if df.empty:
+                raise ValueError("No sites with is_sv_atoi == True were found.")
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if isinstance(sv_sites, pd.DataFrame):
-        df_sites = sv_sites.copy()
-        if 'is_sv_atoi' in df_sites.columns and df_sites['is_sv_atoi'].any():
-            df_sites = df_sites[df_sites['is_sv_atoi']].copy()
         if top_n is not None:
-            df_sites = df_sites.head(top_n)
-        sites = [s for s in df_sites['site'].astype(str) if s in adata_ai.var_names]
-        weights = df_sites.set_index('site').reindex(sites)[weight_col].astype(float).fillna(1.0).values if weight_col in df_sites else None
+            df = df.head(top_n)
+
+        site_names = [s for s in df["site"].astype(str) if s in adata_ai.var_names]
+
+        if weight_col is not None and weight_col in df.columns:
+            weights = (
+                df.set_index("site")
+                .reindex(site_names)[weight_col]
+                .astype(float)
+                .fillna(1.0)
+                .values
+            )
+
     else:
-        sites = [s for s in list(sv_sites) if s in adata_ai.var_names]
+        site_names = [str(s) for s in sites if str(s) in adata_ai.var_names]
+
         if top_n is not None:
-            sites = sites[:top_n]
-        weights = None
-    if not sites:
-        raise ValueError('No SV-A-to-I sites were found in adata_ai.var_names.')
-    site_idx = [adata_ai.var_names.get_loc(s) for s in sites]
-    ratio_mat, cov_mat = _site_ratio_matrix(adata_ai, site_idx, min_cov=min_cov, a_layer=a_layer, g_layer=g_layer)
+            site_names = site_names[:top_n]
+
+    if not site_names:
+        raise ValueError("No requested A-to-I sites were found in adata_ai.var_names.")
+
+    return site_names, weights
+
+
+def select_atoi_score_sites(
+    sv_atoi: pd.DataFrame,
+    adata_ai=None,
+    require_sv: bool = True,
+    fallback_to_ranked: bool = True,
+    top_n: int = 200,
+    min_moran_I: float = 0.0,
+):
+    """
+    Select sites for an A-to-I score from SV-A-to-I results.
+
+    If require_sv=True and too few/no SV sites pass, fallback_to_ranked=True
+    uses the strongest QC-passing positive-Moran sites. This is useful for an
+    exploratory SV-A-to-I score under relaxed discovery thresholds.
+    """
+    if sv_atoi is None or sv_atoi.empty:
+        raise ValueError("sv_atoi is empty.")
+
+    df = sv_atoi.copy()
+
+    if adata_ai is not None:
+        df = df[df["site"].astype(str).isin(adata_ai.var_names)].copy()
+
+    primary = df.copy()
+
+    if require_sv and "is_sv_atoi" in primary.columns:
+        primary = primary[primary["is_sv_atoi"] == True].copy()
+
+    if (
+        primary.empty
+        and fallback_to_ranked
+        and {"pass_qc", "moran_I"}.issubset(df.columns)
+    ):
+        primary = df[
+            (df["pass_qc"] == True)
+            & pd.to_numeric(df["moran_I"], errors="coerce").gt(min_moran_I)
+        ].copy()
+        primary["is_sv_atoi"] = True
+        primary["score_site_source"] = "ranked_positive_moran_fallback"
+    else:
+        primary["score_site_source"] = "called_sv_atoi"
+
+    sort_cols = []
+    ascending = []
+
+    for col, asc in [
+        ("moran_fdr", True),
+        ("moran_p", True),
+        ("moran_I", False),
+        ("sd_ratio", False),
+    ]:
+        if col in primary.columns:
+            sort_cols.append(col)
+            ascending.append(asc)
+
+    if sort_cols:
+        primary = primary.sort_values(sort_cols, ascending=ascending)
+
+    if top_n is not None:
+        primary = primary.head(top_n)
+
+    if primary.empty:
+        raise ValueError("No A-to-I score sites were selected.")
+
+    return primary.reset_index(drop=True)
+
+
+def compute_sv_atoi_score(
+    adata_ai,
+    sv_atoi: pd.DataFrame,
+    score_name: str = "sv_atoi_score",
+    min_cov: int = 10,
+    top_n: int = 200,
+    weight_col: str = "moran_I",
+    require_sv: bool = True,
+    fallback_to_ranked: bool = True,
+    zscore_sites: bool = True,
+    a_layer: str = "A",
+    g_layer: str = "G",
+):
+    """
+    Compute an SV-A-to-I score, with optional fallback to ranked spatial sites.
+    """
+    score_sites = select_atoi_score_sites(
+        sv_atoi=sv_atoi,
+        adata_ai=adata_ai,
+        require_sv=require_sv,
+        fallback_to_ranked=fallback_to_ranked,
+        top_n=top_n,
+    )
+
+    score = compute_multisite_atoi_score(
+        adata_ai=adata_ai,
+        sites=score_sites,
+        score_name=score_name,
+        min_cov=min_cov,
+        top_n=None,
+        weight_col=weight_col,
+        require_sv=False,
+        a_layer=a_layer,
+        g_layer=g_layer,
+        zscore_sites=zscore_sites,
+    )
+
+    adata_ai.uns[f"{score_name}_site_table"] = score_sites
+
+    return score, score_sites
+
+
+def compute_multisite_atoi_score(
+    adata_ai,
+    sites: Optional[Union[pd.DataFrame, Iterable[str]]] = None,
+    score_name: str = "global_atoi_score",
+    min_cov: int = 10,
+    top_n: Optional[int] = None,
+    weight_col: Optional[str] = None,
+    require_sv: bool = False,
+    a_layer: str = "A",
+    g_layer: str = "G",
+    zscore_sites: bool = True,
+):
+    """
+    Compute a spot-level multi-site A-to-I score.
+
+    For global A-to-I score:
+        sites=None
+        require_sv=False
+        weight_col=None
+
+    For SV-A-to-I score:
+        sites=sv_atoi
+        require_sv=True
+        weight_col='moran_I'
+        top_n=200
+    """
+    site_names, weights = _resolve_site_list(
+        adata_ai=adata_ai,
+        sites=sites,
+        top_n=top_n,
+        require_sv=require_sv,
+        weight_col=weight_col,
+    )
+
+    site_idx = [adata_ai.var_names.get_loc(s) for s in site_names]
+
+    ratio_mat, cov_mat = _site_ratio_matrix(
+        adata_ai,
+        site_idx,
+        min_cov=min_cov,
+        a_layer=a_layer,
+        g_layer=g_layer,
+    )
+
     score_mat = ratio_mat.copy()
+
     if zscore_sites:
         mu = np.nanmean(score_mat, axis=0)
         sd = np.nanstd(score_mat, axis=0)
         sd[sd == 0] = np.nan
         score_mat = (score_mat - mu) / sd
+
+    valid = np.isfinite(score_mat)
+
     if weights is None:
         score = np.nanmean(score_mat, axis=1)
     else:
         weights = np.asarray(weights, dtype=float)
         weights = np.where(np.isfinite(weights) & (weights > 0), weights, 1.0)
-        valid = np.isfinite(score_mat)
+
         numerator = np.nansum(np.where(valid, score_mat * weights, np.nan), axis=1)
         denominator = np.sum(valid * weights, axis=1)
+
         score = numerator / denominator
         score[denominator == 0] = np.nan
+
     adata_ai.obs[score_name] = score
-    adata_ai.obs[f'{score_name}_n_sites'] = np.sum(np.isfinite(ratio_mat), axis=1)
-    adata_ai.obs[f'{score_name}_mean_cov'] = np.nanmean(np.where(cov_mat >= min_cov, cov_mat, np.nan), axis=1)
-    adata_ai.uns[f'{score_name}_sites'] = sites
+    adata_ai.obs[f"{score_name}_n_sites"] = np.sum(np.isfinite(ratio_mat), axis=1)
+    adata_ai.obs[f"{score_name}_mean_cov"] = np.nanmean(
+        np.where(cov_mat >= min_cov, cov_mat, np.nan),
+        axis=1,
+    )
+    adata_ai.uns[f"{score_name}_sites"] = site_names
+
     return pd.Series(score, index=adata_ai.obs_names, name=score_name)
 
-def analyze_atoi_deconv_association(adata_ai, df_deconv=None, score_key='sv_atoi_score', celltype_cols=None, covariates=None, group_key=None, min_complete=30, store_key='atoi_deconv_association'):
-    """Associate an A-to-I score with deconvolved cell-type proportions.
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-covariates : object
-    Additional covariate columns to include in regression models.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-min_complete : object
-    Function argument used by this helper.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    covariates = [] if covariates is None else list(covariates)
-    if df_deconv is None:
-        df = adata_ai.obs.copy()
-    else:
-        common = adata_ai.obs_names.intersection(df_deconv.index)
-        df = adata_ai.obs.loc[common, [score_key]].join(df_deconv.loc[common], how='left')
-        if group_key is not None and group_key in adata_ai.obs.columns:
-            df[group_key] = adata_ai.obs.loc[common, group_key]
-    if score_key not in df.columns:
-        raise ValueError(f'{score_key!r} not found in adata_ai.obs or joined deconvolution table.')
-    if celltype_cols is None:
-        meta = {'in_tissue', 'x_array', 'y_array', 'x_pixel', 'y_pixel', 'celltype_sum', score_key}
-        celltype_cols = [c for c in df.columns if c not in meta and pd.api.types.is_numeric_dtype(df[c])]
-    rows = []
-    for ct in celltype_cols:
-        cols = [score_key, ct] + [c for c in covariates if c in df.columns]
-        sub = df.loc[:, cols].dropna()
-        if sub.shape[0] < min_complete or sub[ct].std() == 0 or sub[score_key].std() == 0:
-            continue
-        rho, p_spear = spearmanr(sub[ct], sub[score_key])
-        X = sub[[ct] + [c for c in covariates if c in sub.columns]].astype(float).copy()
-        for c in X.columns:
-            sd = X[c].std()
-            if sd > 0:
-                X[c] = (X[c] - X[c].mean()) / sd
-        y = sub[score_key].astype(float)
-        y = (y - y.mean()) / y.std()
-        fit = sm.OLS(y, sm.add_constant(X, has_constant='add')).fit()
-        rows.append({'celltype': ct, 'n_spots': int(sub.shape[0]), 'spearman_rho': float(rho), 'spearman_p': float(p_spear), 'ols_beta': float(fit.params[ct]), 'ols_p': float(fit.pvalues[ct]), 'ols_r2': float(fit.rsquared)})
-    res = pd.DataFrame(rows)
-    if not res.empty:
-        res['spearman_fdr'] = multipletests(res['spearman_p'], method='fdr_bh')[1]
-        res['ols_fdr'] = multipletests(res['ols_p'], method='fdr_bh')[1]
-        res = res.sort_values(['ols_fdr', 'spearman_fdr']).reset_index(drop=True)
-    if group_key is not None and group_key in df.columns:
-        adata_ai.uns[f'{store_key}_group_summary'] = df.groupby(group_key, observed=True)[score_key].agg(['count', 'mean', 'median', 'std']).sort_values('mean', ascending=False)
-    adata_ai.uns[store_key] = res
-    return res
-
-def compute_atoi_residual_after_deconv(adata_ai, df_deconv=None, score_key='sv_atoi_score', celltype_cols=None, covariates=None, residual_key='sv_atoi_residual', spatial_k=6, store_key='atoi_residual_model'):
-    """Regress an A-to-I score on cell-type proportions and compute residual spatial signal.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-covariates : object
-    Additional covariate columns to include in regression models.
-residual_key : object
-    Name of the residual column written to `adata_ai.obs`.
-spatial_k : object
-    Number of nearest neighbors used for spatial autocorrelation statistics.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    covariates = [] if covariates is None else list(covariates)
-    if df_deconv is None:
-        df = adata_ai.obs.copy()
-    else:
-        common = adata_ai.obs_names.intersection(df_deconv.index)
-        df = adata_ai.obs.loc[common, [score_key]].join(df_deconv.loc[common], how='left')
-    if celltype_cols is None:
-        meta = {'in_tissue', 'x_array', 'y_array', 'x_pixel', 'y_pixel', 'celltype_sum', score_key}
-        celltype_cols = [c for c in df.columns if c not in meta and pd.api.types.is_numeric_dtype(df[c])]
-    model_cols = [c for c in list(celltype_cols) + covariates if c in df.columns]
-    sub = df[[score_key] + model_cols].dropna().copy()
-    if sub.shape[0] < max(30, len(model_cols) + 5):
-        raise ValueError('Not enough complete spots for residual analysis.')
-    X = sub[model_cols].astype(float).copy()
-    for c in X.columns:
-        sd = X[c].std()
-        if sd > 0:
-            X[c] = (X[c] - X[c].mean()) / sd
-    y = sub[score_key].astype(float)
-    fit = sm.OLS(y, sm.add_constant(X, has_constant='add')).fit()
-    residual = pd.Series(np.nan, index=adata_ai.obs_names, name=residual_key)
-    residual.loc[sub.index] = fit.resid
-    adata_ai.obs[residual_key] = residual
-    coords = _coords_from_adata(adata_ai)
-    moran_i, moran_p, geary_c, geary_p = _safe_moran_geary(residual.values, coords, spatial_k=spatial_k)
-    summary = {'n_spots': int(sub.shape[0]), 'model_r2': float(fit.rsquared), 'model_adj_r2': float(fit.rsquared_adj), 'moran_I_residual': moran_i, 'moran_p_residual': moran_p, 'geary_C_residual': geary_c, 'geary_p_residual': geary_p, 'celltype_cols': list(celltype_cols), 'covariates': covariates}
-    adata_ai.uns[store_key] = summary
-    adata_ai.uns[f'{store_key}_params'] = fit.params.to_frame('coef').join(fit.pvalues.to_frame('pval'))
-    return (residual, fit, summary)
-
-def summarize_atoi_by_group(adata_ai, score_key='sv_atoi_score', group_key='ground_truth'):
-    """Summarize an A-to-I score across spatial groups.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if group_key not in adata_ai.obs.columns:
-        raise ValueError(f'{group_key!r} not found in adata_ai.obs')
-    return adata_ai.obs[[score_key, group_key]].dropna().groupby(group_key, observed=True)[score_key].agg(['count', 'mean', 'median', 'std']).sort_values('mean', ascending=False)
-
-def _spatial_axes(ax, adata, values, title, cmap='magma', spot_size=18, clip=(1, 99), center=None):
-    """Draw a reusable spatial scatter plot on a provided axis.
-
-Parameters
-----------
-ax : object
-    Matplotlib Axes object.
-adata : object
-    AnnData object containing spatial coordinates and observations.
-values : object
-    Numeric values to plot or aggregate.
-title : object
-    Plot title.
-cmap : object
-    Matplotlib or seaborn colormap name/object.
-spot_size : object
-    Marker size for spatial plots.
-clip : object
-    Lower and upper percentiles used to clip plotted values.
-center : object
-    Optional center value for symmetric color scaling.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    coords = _coords_from_adata(adata)
-    x, y = (coords[:, 0], coords[:, 1])
-    values = np.asarray(values, dtype=float)
-    mask = np.isfinite(values)
-    ax.scatter(x[~mask], y[~mask], s=spot_size, c='#d9d9d9', alpha=0.22, linewidths=0)
-    if mask.sum() == 0:
-        ax.set_title(title)
-        ax.invert_yaxis()
-        ax.set_aspect('equal')
-        ax.axis('off')
-        return None
-    vmin, vmax = np.nanpercentile(values[mask], clip)
-    if center is not None:
-        lim = max(abs(vmin - center), abs(vmax - center))
-        vmin, vmax = (center - lim, center + lim)
-    sc = ax.scatter(x[mask], y[mask], s=spot_size, c=values[mask], cmap=cmap, vmin=vmin, vmax=vmax, linewidths=0)
-    ax.set_title(title, fontsize=11, pad=8)
-    ax.invert_yaxis()
-    ax.set_aspect('equal')
-    ax.axis('off')
-    return sc
-
-def _cluster_level_site_values(adata_ai, site, group_labels, min_cov=10, a_layer='A', g_layer='G'):
-    """Aggregate one site's A/G counts by group and map group-level ratios back to spots.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-site : object
-    A-to-I site identifier present in `adata_ai.var_names`.
-group_labels : object
-    Group labels aligned to `adata_ai.obs_names`.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
+def compute_global_atoi_ratio(
+    adata_ai,
+    ratio_key: str = "global_atoi_ratio",
+    coverage_key: str = "global_atoi_cov",
+    min_total_cov: int = 20,
+    a_layer: str = "A",
+    g_layer: str = "G",
+):
+    """
+    Compute raw per-spot global G/(A+G) ratio across all retained sites.
+    This is not z-scored.
+    """
     A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
-    j = adata_ai.var_names.get_loc(site)
-    a = _dense_col(A, j)
-    g = _dense_col(G, j)
-    cov = a + g
-    df = pd.DataFrame({'group': group_labels.astype(str), 'A': a, 'G': g, 'cov': cov}, index=adata_ai.obs_names)
-    agg = df.groupby('group', observed=True)[['A', 'G']].sum()
-    agg['cov'] = agg['A'] + agg['G']
-    agg['ratio'] = np.nan
-    valid = agg['cov'] >= min_cov
-    agg.loc[valid, 'ratio'] = agg.loc[valid, 'G'] / agg.loc[valid, 'cov']
-    return (df['group'].map(agg['ratio']).to_numpy(dtype=float), agg)
 
-def plot_sv_atoi_discovery_landscape(sv_atoi, fdr_cutoff=0.05, top_n_labels=8, figsize=(12, 4)):
-    """Create an overview figure for SV-A-to-I discovery results.
-
-Parameters
-----------
-sv_atoi : object
-    DataFrame returned by `detect_spatial_atoi_sites()`.
-fdr_cutoff : object
-    FDR threshold used to call significant SV-A-to-I sites.
-top_n_labels : object
-    Number of top sites to annotate on the plot.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    df = sv_atoi.copy()
-    df['neglog10_fdr'] = -np.log10(df['moran_fdr'].clip(lower=1e-300))
-    df['status'] = np.where(df.get('is_sv_atoi', False), 'SV-A-to-I', 'not SV')
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    ax = axes[0]
-    counts = pd.Series({'all sites': len(df), 'QC pass': int(df['pass_qc'].sum()) if 'pass_qc' in df else len(df), 'SV-A-to-I': int(df.get('is_sv_atoi', pd.Series(False, index=df.index)).sum())})
-    sns.barplot(x=counts.index, y=counts.values, ax=ax, palette=['#8da0cb', '#66c2a5', '#fc8d62'])
-    ax.set_ylabel('site count')
-    ax.set_xlabel('')
-    ax.set_title('Discovery funnel')
-    ax.tick_params(axis='x', rotation=25)
-    ax = axes[1]
-    colors = df['status'].map({'not SV': '#bdbdbd', 'SV-A-to-I': '#d95f02'}).fillna('#bdbdbd')
-    sizes = np.clip(df.get('n_valid_spots', pd.Series(20, index=df.index)).astype(float) / 3, 12, 90)
-    mask = df['moran_I'].notna() & df['neglog10_fdr'].notna()
-    ax.scatter(df.loc[mask, 'moran_I'], df.loc[mask, 'neglog10_fdr'], s=sizes.loc[mask], c=colors.loc[mask], linewidths=0, alpha=0.75)
-    ax.axhline(-np.log10(fdr_cutoff), color='black', linestyle='--', linewidth=1)
-    ax.axvline(0, color='black', linewidth=0.8)
-    ax.set_xlabel("Moran's I")
-    ax.set_ylabel('-log10(FDR)')
-    ax.set_title('Spatial autocorrelation')
-    ax.legend(handles=[Line2D([0], [0], marker='o', color='w', label='not SV', markerfacecolor='#bdbdbd', markersize=6), Line2D([0], [0], marker='o', color='w', label='SV-A-to-I', markerfacecolor='#d95f02', markersize=6)], frameon=False, fontsize=8)
-    label_df = df.sort_values(['is_sv_atoi', 'moran_fdr', 'moran_I'], ascending=[False, True, False]).head(top_n_labels)
-    for _, row in label_df.iterrows():
-        label = row['gene'] if isinstance(row.get('gene', ''), str) and row.get('gene', '') else row['site']
-        ax.text(row['moran_I'], row['neglog10_fdr'], str(label)[:14], fontsize=7)
-    ax = axes[2]
-    colors2 = df['status'].map({'not SV': '#bdbdbd', 'SV-A-to-I': '#7570b3'}).fillna('#bdbdbd')
-    mask = df['n_valid_spots'].notna() & df['sd_ratio'].notna()
-    ax.scatter(df.loc[mask, 'n_valid_spots'], df.loc[mask, 'sd_ratio'], c=colors2.loc[mask], s=28, linewidths=0, alpha=0.75)
-    ax.set_xlabel('valid spots')
-    ax.set_ylabel('editing ratio SD')
-    ax.set_title('Coverage and variability')
-    ax.legend_.remove() if ax.legend_ else None
-    plt.tight_layout()
-    return (fig, axes)
-
-def plot_cluster_level_residual_atoi(adata_ai, residual_key='sv_atoi_residual', group_key='ground_truth', adata_group=None, spot_size=18, cmap='coolwarm', figsize=(10, 4.2)):
-    """Compare spot-level and cluster-level residual A-to-I signals.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-residual_key : object
-    Name of the residual column written to `adata_ai.obs`.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-adata_group : object
-    Optional AnnData object containing group labels aligned by barcode.
-spot_size : object
-    Marker size for spatial plots.
-cmap : object
-    Matplotlib or seaborn colormap name/object.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if residual_key not in adata_ai.obs:
-        raise ValueError(f'{residual_key!r} not found in adata_ai.obs')
-    if adata_group is not None:
-        common = adata_ai.obs_names.intersection(adata_group.obs_names)
-        adata_use = adata_ai[common].copy()
-        labels = adata_group.obs.loc[common, group_key].astype(str)
-    else:
-        adata_use = adata_ai
-        if group_key not in adata_use.obs:
-            raise ValueError(f'{group_key!r} not found in adata_ai.obs')
-        labels = adata_use.obs[group_key].astype(str)
-    residual = adata_use.obs[residual_key].astype(float)
-    group_mean = residual.groupby(labels, observed=True).mean()
-    cluster_residual = labels.map(group_mean).to_numpy(dtype=float)
-    fig, axes = plt.subplots(1, 3, figsize=figsize, gridspec_kw={'width_ratios': [1, 1, 0.9]})
-    sc0 = _spatial_axes(axes[0], adata_use, residual.values, 'Spot-level residual A-to-I', cmap=cmap, spot_size=spot_size, center=0)
-    sc1 = _spatial_axes(axes[1], adata_use, cluster_residual, f'Cluster-level residual\\n{group_key}', cmap=cmap, spot_size=spot_size, center=0)
-    if sc0 is not None:
-        fig.colorbar(sc0, ax=axes[0], fraction=0.046, pad=0.02)
-    if sc1 is not None:
-        fig.colorbar(sc1, ax=axes[1], fraction=0.046, pad=0.02)
-    summary = pd.DataFrame({'group': labels.values, 'residual': residual.values}).dropna().groupby('group', observed=True)['residual'].agg(['count', 'mean', 'median', 'std']).sort_values('mean')
-    sns.barplot(data=summary.reset_index(), y='group', x='mean', ax=axes[2], color='#8da0cb', edgecolor='black', linewidth=0.4)
-    axes[2].axvline(0, color='black', linewidth=1)
-    axes[2].set_xlabel('mean residual')
-    axes[2].set_ylabel('')
-    axes[2].set_title('Residual by group', fontsize=11, pad=8)
-    plt.tight_layout()
-    return (fig, axes, summary)
-
-def plot_spatial_atoi_overview(adata_ai, score_key='sv_atoi_score', residual_key='sv_atoi_residual', group_key='ground_truth', celltype_values=None, celltype_name=None, spot_size=18, figsize=None):
-    """Create a multi-panel spatial overview of A-to-I score, residuals, cell types, and groups.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-residual_key : object
-    Name of the residual column written to `adata_ai.obs`.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-celltype_values : object
-    Numeric cell-type proportion values aligned to `adata_ai.obs_names`.
-celltype_name : object
-    Name of the cell type shown in the plot title.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    panels = [(score_key, adata_ai.obs[score_key].values, 'SV-A-to-I score', 'magma', None)]
-    if residual_key in adata_ai.obs:
-        panels.append((residual_key, adata_ai.obs[residual_key].values, 'Residual A-to-I', 'coolwarm', 0))
-    if celltype_values is not None:
-        panels.append(('celltype', np.asarray(celltype_values, dtype=float), f"{celltype_name or 'Cell type'} proportion", 'viridis', None))
-    if group_key in adata_ai.obs:
-        groups = pd.Categorical(adata_ai.obs[group_key].astype(str))
-        panels.append(('group', groups.codes.astype(float), f'{group_key}', 'tab20', None))
-    n = len(panels)
-    if figsize is None:
-        figsize = (4.2 * n, 4.2)
-    fig, axes = plt.subplots(1, n, figsize=figsize)
-    axes = np.atleast_1d(axes)
-    for ax, (_, values, title, cmap, center) in zip(axes, panels):
-        sc = _spatial_axes(ax, adata_ai, values, title, cmap=cmap, spot_size=spot_size, center=center)
-        if sc is not None and cmap != 'tab20':
-            cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
-            cb.ax.tick_params(labelsize=8)
-    plt.tight_layout()
-    return (fig, axes)
-
-def plot_cluster_level_atoi_site_panel(adata_ai, sv_atoi, group_key='ground_truth', adata_group=None, top_n=6, min_cov=10, spot_size=16, cmap='rocket_r', figsize=None):
-    """Plot top SV-A-to-I sites as cluster-level editing-ratio maps.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-sv_atoi : object
-    DataFrame returned by `detect_spatial_atoi_sites()`.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-adata_group : object
-    Optional AnnData object containing group labels aligned by barcode.
-top_n : object
-    Maximum number of top-ranked sites or entries to use.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-spot_size : object
-    Marker size for spatial plots.
-cmap : object
-    Matplotlib or seaborn colormap name/object.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if adata_group is not None:
-        common = adata_ai.obs_names.intersection(adata_group.obs_names)
-        adata_use = adata_ai[common].copy()
-        labels = adata_group.obs.loc[common, group_key].astype(str)
-    else:
-        adata_use = adata_ai
-        if group_key not in adata_use.obs:
-            raise ValueError(f'{group_key!r} not found in adata_ai.obs')
-        labels = adata_use.obs[group_key].astype(str)
-    sites_df = sv_atoi.copy()
-    if 'is_sv_atoi' in sites_df and sites_df['is_sv_atoi'].any():
-        sites_df = sites_df[sites_df['is_sv_atoi']]
-    sites = [s for s in sites_df['site'].head(top_n) if s in adata_use.var_names]
-    if not sites:
-        raise ValueError('No top SV-A-to-I sites found in adata_ai.var_names')
-    ncols = min(3, len(sites))
-    nrows = int(np.ceil(len(sites) / ncols))
-    if figsize is None:
-        figsize = (4.1 * ncols, 4.0 * nrows)
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
-    axes = np.atleast_1d(axes).ravel()
-    palette = sns.color_palette(cmap, as_cmap=True)
-    for ax, site in zip(axes, sites):
-        values, agg = _cluster_level_site_values(adata_use, site, labels, min_cov=min_cov)
-        gene = adata_use.var.loc[site].get('Gene.refGene', site) if site in adata_use.var.index else site
-        title = f'{gene}\\n{site}'
-        sc = _spatial_axes(ax, adata_use, values, title, cmap=palette, spot_size=spot_size)
-        if sc is not None:
-            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
-        ax.text(0.02, 0.02, f"groups={agg['ratio'].notna().sum()}", transform=ax.transAxes, fontsize=8, ha='left', va='bottom')
-    for ax in axes[len(sites):]:
-        ax.axis('off')
-    fig.suptitle(f'Cluster-level A-to-I ratio for top SV sites ({group_key})', y=1.02, fontsize=13)
-    plt.tight_layout()
-    return (fig, axes)
-
-def plot_atoi_group_raincloud(adata_ai, score_key='sv_atoi_score', group_key='ground_truth', order=None, figsize=(8, 4)):
-    """Plot A-to-I score distributions across spatial groups.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-order : object
-    Function argument used by this helper.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    df = adata_ai.obs[[score_key, group_key]].dropna().copy()
-    df[group_key] = df[group_key].astype(str)
-    if order is None:
-        order = df.groupby(group_key, observed=True)[score_key].median().sort_values().index.tolist()
-    fig, ax = plt.subplots(figsize=figsize)
-    sns.violinplot(data=df, x=group_key, y=score_key, order=order, inner=None, cut=0, color='#d8ecf3', ax=ax)
-    sns.boxplot(data=df, x=group_key, y=score_key, order=order, width=0.22, showcaps=False, boxprops={'facecolor': 'white', 'edgecolor': 'black', 'linewidth': 1}, whiskerprops={'linewidth': 1}, medianprops={'color': 'black', 'linewidth': 1.2}, showfliers=False, ax=ax)
-    sns.stripplot(data=df, x=group_key, y=score_key, order=order, size=2, alpha=0.28, color='#333333', ax=ax)
-    ax.axhline(0, color='black', linewidth=0.8, alpha=0.45)
-    ax.set_xlabel('')
-    ax.set_ylabel(score_key)
-    ax.set_title('SV-A-to-I regulatory score across spatial groups')
-    ax.tick_params(axis='x', rotation=45)
-    plt.tight_layout()
-    return (fig, ax)
-
-def plot_atoi_deconv_dotplot(assoc_df, beta_col='ols_beta', fdr_col='ols_fdr', figsize=(7, 4)):
-    """Plot cell-type association coefficients and FDR values.
-
-Parameters
-----------
-assoc_df : object
-    Association result DataFrame.
-beta_col : object
-    Column containing beta coefficients.
-fdr_col : object
-    Column containing FDR-adjusted p-values.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    df = assoc_df.copy()
-    if df.empty:
-        raise ValueError('assoc_df is empty')
-    df = df.sort_values(beta_col)
-    y = np.arange(df.shape[0])
-    sig = -np.log10(df[fdr_col].clip(lower=1e-300))
-    sizes = np.clip(30 + sig * 25, 40, 260)
-    colors = np.where(df[beta_col] >= 0, '#d95f02', '#1b9e77')
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.hlines(y, 0, df[beta_col], color='#bdbdbd', linewidth=1.5)
-    ax.scatter(df[beta_col], y, s=sizes, c=colors, edgecolor='white', linewidth=0.8, zorder=3)
-    ax.axvline(0, color='black', linewidth=1)
-    ax.set_yticks(y)
-    ax.set_yticklabels(df['celltype'])
-    ax.set_xlabel('adjusted beta with SV-A-to-I score')
-    ax.set_title('Cell-type-associated A-to-I regulatory signal')
-    for yi, (_, row) in enumerate(df.iterrows()):
-        ax.text(row[beta_col], yi + 0.18, f'FDR={row[fdr_col]:.1e}', fontsize=7, ha='center')
-    plt.tight_layout()
-    return (fig, ax)
-
-def plot_atoi_colocalization_dashboard(adata_ai, df_deconv, celltype, score_key='sv_atoi_score', residual_key=None, spot_size=18, figsize=(14, 4)):
-    """Visualize spatial co-localization between A-to-I score and one cell type.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-celltype : object
-    Cell-type column to visualize or test.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-residual_key : object
-    Name of the residual column written to `adata_ai.obs`.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    common = adata_ai.obs_names.intersection(df_deconv.index)
-    adata_use = adata_ai[common].copy()
-    score = adata_use.obs[score_key].astype(float).values
-    cell = df_deconv.loc[common, celltype].astype(float).values
-    fig, axes = plt.subplots(1, 4, figsize=figsize)
-    _spatial_axes(axes[0], adata_use, score, 'SV-A-to-I score', cmap='magma', spot_size=spot_size)
-    _spatial_axes(axes[1], adata_use, cell, f'{celltype} proportion', cmap='viridis', spot_size=spot_size)
-    mask = np.isfinite(score) & np.isfinite(cell)
-    hi_score = score >= np.nanquantile(score[mask], 0.5)
-    hi_cell = cell >= np.nanquantile(cell[mask], 0.5)
-    group = np.full(len(score), np.nan)
-    group[mask & ~hi_score & ~hi_cell] = 0
-    group[mask & hi_score & ~hi_cell] = 1
-    group[mask & ~hi_score & hi_cell] = 2
-    group[mask & hi_score & hi_cell] = 3
-    cmap = plt.matplotlib.colors.ListedColormap(['#e8e8e8', '#64acbe', '#c85a5a', '#574249'])
-    _spatial_axes(axes[2], adata_use, group, 'Bivariate co-localization', cmap=cmap, spot_size=spot_size, clip=(0, 100))
-    rho, pval = spearmanr(cell[mask], score[mask]) if mask.sum() > 2 else (np.nan, np.nan)
-    sns.regplot(x=cell[mask], y=score[mask], scatter_kws={'s': 14, 'alpha': 0.45, 'linewidth': 0}, line_kws={'color': 'black'}, lowess=True, ax=axes[3])
-    axes[3].set_xlabel(f'{celltype} proportion')
-    axes[3].set_ylabel('SV-A-to-I score')
-    axes[3].set_title(f'rho={rho:.2f}, p={pval:.1e}')
-    if residual_key and residual_key in adata_use.obs:
-        axes[3].text(0.03, 0.97, f'Residual: {residual_key}', transform=axes[3].transAxes, va='top', fontsize=8)
-    plt.tight_layout()
-    return (fig, axes)
-
-def plot_top_site_celltype_examples(adata_ai, df_deconv, res_hits, n_examples=3, min_cov=10, spot_size=16, figsize=None):
-    """Plot top site-cell-type examples using editing, cell-type, and bivariate maps.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-res_hits : object
-    DataFrame of significant site-cell-type association results.
-n_examples : object
-    Number of top examples to plot.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    pairs = res_hits.sort_values(['padj', 'abs_coef'] if 'abs_coef' in res_hits else ['padj']).drop_duplicates(['site', 'term']).head(n_examples)
-    if pairs.empty:
-        raise ValueError('res_hits has no site-celltype pairs')
-    if figsize is None:
-        figsize = (12, 3.6 * len(pairs))
-    fig, axes = plt.subplots(len(pairs), 3, figsize=figsize)
-    axes = np.atleast_2d(axes)
-    A, G = _get_count_layers(adata_ai)
-    for r, (_, row) in enumerate(pairs.iterrows()):
-        site = row['site']
-        celltype = row['term']
-        common = adata_ai.obs_names.intersection(df_deconv.index)
-        adata_use = adata_ai[common].copy()
-        j = adata_use.var_names.get_loc(site)
-        a = _dense_col(_as_csr(adata_use.layers['A']), j)
-        g = _dense_col(_as_csr(adata_use.layers['G']), j)
-        cov = a + g
-        ratio = np.full(adata_use.n_obs, np.nan)
-        valid = cov >= min_cov
-        ratio[valid] = g[valid] / cov[valid]
-        cell = df_deconv.loc[common, celltype].astype(float).values
-        gene = adata_use.var.loc[site].get('Gene.refGene', site) if site in adata_use.var.index else site
-        _spatial_axes(axes[r, 0], adata_use, ratio, f'{gene} editing\\n{site}', cmap='magma', spot_size=spot_size)
-        _spatial_axes(axes[r, 1], adata_use, cell, f'{celltype} proportion', cmap='viridis', spot_size=spot_size)
-        mask = np.isfinite(ratio) & np.isfinite(cell)
-        hi_ratio = ratio >= np.nanquantile(ratio[mask], 0.5)
-        hi_cell = cell >= np.nanquantile(cell[mask], 0.5)
-        group = np.full(len(ratio), np.nan)
-        group[mask & ~hi_ratio & ~hi_cell] = 0
-        group[mask & hi_ratio & ~hi_cell] = 1
-        group[mask & ~hi_ratio & hi_cell] = 2
-        group[mask & hi_ratio & hi_cell] = 3
-        cmap = plt.matplotlib.colors.ListedColormap(['#e8e8e8', '#64acbe', '#c85a5a', '#574249'])
-        _spatial_axes(axes[r, 2], adata_use, group, f'Editing x {celltype}', cmap=cmap, spot_size=spot_size, clip=(0, 100))
-        axes[r, 2].text(0.02, 0.02, f"coef={row.get('coef_logit', np.nan):.2f}\\nFDR={row.get('padj', np.nan):.1e}", transform=axes[r, 2].transAxes, fontsize=8, va='bottom')
-    plt.tight_layout()
-    return (fig, axes)
-
-def add_gene_expression_to_obs(adata_expr, target_adata, genes=('ADAR', 'ADARB1', 'ADARB2'), prefix='expr_', layer=None, log1p=False):
-    """Copy selected gene expression values into an A-to-I AnnData object by shared barcode.
-
-Parameters
-----------
-adata_expr : object
-    AnnData object containing gene expression values.
-target_adata : object
-    AnnData object that receives copied expression values in `.obs`.
-genes : object
-    Gene symbols to copy from expression AnnData.
-prefix : object
-    Prefix added to copied expression columns.
-layer : object
-    Optional expression layer to use instead of `.X`.
-log1p : object
-    Whether to apply log1p transformation to copied expression values.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    common = target_adata.obs_names.intersection(adata_expr.obs_names)
-    added = []
-    for gene in genes:
-        if gene not in adata_expr.var_names:
-            continue
-        x = adata_expr[common, gene].layers[layer] if layer is not None else adata_expr[common, gene].X
-        values = x.toarray().ravel() if hasattr(x, 'toarray') else np.asarray(x).ravel()
-        values = values.astype(float)
-        if log1p:
-            values = np.log1p(values)
-        col = f'{prefix}{gene}'
-        target_adata.obs[col] = np.nan
-        target_adata.obs.loc[common, col] = values
-        added.append(col)
-    return added
-
-def compute_global_atoi_ratio(adata_ai, ratio_key='global_atoi_ratio', coverage_key='global_atoi_cov', min_total_cov=20, a_layer='A', g_layer='G'):
-    """Compute a per-spot global A-to-I ratio across all retained sites.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-ratio_key : object
-    Name of the global A-to-I ratio column written to `.obs`.
-coverage_key : object
-    Name of the total coverage column written to `.obs`.
-min_total_cov : object
-    Minimum per-spot total coverage required to compute global ratio.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
-    total_A = np.asarray(A.sum(axis=1)).ravel()
-    total_G = np.asarray(G.sum(axis=1)).ravel()
+    total_A = _dense_sum(A, axis=1)
+    total_G = _dense_sum(G, axis=1)
     cov = total_A + total_G
+
     ratio = np.full(adata_ai.n_obs, np.nan, dtype=float)
     valid = cov >= min_total_cov
     ratio[valid] = total_G[valid] / cov[valid]
+
     adata_ai.obs[ratio_key] = ratio
     adata_ai.obs[coverage_key] = cov
+
     return pd.Series(ratio, index=adata_ai.obs_names, name=ratio_key)
 
-def plot_cluster_level_obs_value(adata, value_key, group_key='ground_truth', adata_group=None, aggfunc='mean', spot_size=18, cmap='magma', center=None, figsize=(10, 4.2)):
-    """Visualize one observation-level value at spot and group-aggregated levels.
 
-Parameters
-----------
-adata : object
-    AnnData object containing spatial coordinates and observations.
-value_key : object
-    Observation column to visualize.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-adata_group : object
-    Optional AnnData object containing group labels aligned by barcode.
-aggfunc : object
-    Aggregation function used to summarize spot values by group.
-spot_size : object
-    Marker size for spatial plots.
-cmap : object
-    Matplotlib or seaborn colormap name/object.
-center : object
-    Optional center value for symmetric color scaling.
-figsize : object
-    Matplotlib figure size.
+def get_site_editing_ratio(
+    adata_ai,
+    site: str,
+    min_cov: int = 10,
+    a_layer: str = "A",
+    g_layer: str = "G",
+) -> pd.Series:
+    if site not in adata_ai.var_names:
+        raise ValueError(f"{site!r} not found in adata_ai.var_names")
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if value_key not in adata.obs:
-        raise ValueError(f'{value_key!r} not found in adata.obs')
-    if adata_group is not None:
-        common = adata.obs_names.intersection(adata_group.obs_names)
-        adata_use = adata[common].copy()
-        labels = adata_group.obs.loc[common, group_key].astype(str)
-    else:
-        adata_use = adata
-        if group_key not in adata_use.obs:
-            raise ValueError(f'{group_key!r} not found in adata.obs')
-        labels = adata_use.obs[group_key].astype(str)
-    values = adata_use.obs[value_key].astype(float)
-    grouped = values.groupby(labels, observed=True).agg(aggfunc)
-    cluster_values = labels.map(grouped).to_numpy(dtype=float)
-    fig, axes = plt.subplots(1, 3, figsize=figsize, gridspec_kw={'width_ratios': [1, 1, 0.9]})
-    sc0 = _spatial_axes(axes[0], adata_use, values.values, f'Spot-level {value_key}', cmap=cmap, spot_size=spot_size, center=center)
-    sc1 = _spatial_axes(axes[1], adata_use, cluster_values, f'Cluster-level {value_key}\\n{group_key}', cmap=cmap, spot_size=spot_size, center=center)
+    A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
+
+    j = adata_ai.var_names.get_loc(site)
+
+    a = _dense_col(A, j)
+    g = _dense_col(G, j)
+    cov = a + g
+
+    ratio = np.full(adata_ai.n_obs, np.nan, dtype=float)
+    valid = cov >= min_cov
+    ratio[valid] = g[valid] / cov[valid]
+
+    return pd.Series(ratio, index=adata_ai.obs_names, name=site)
+
+
+# =============================================================================
+# 3. Spatial visualization
+# =============================================================================
+
+def _spatial_axes(
+    ax,
+    adata,
+    values,
+    title: str,
+    cmap="magma",
+    spot_size: int = 18,
+    clip=(1, 99),
+    center=None,
+):
+    coords = _coords_from_adata(adata)
+
+    x = coords[:, 0]
+    y = coords[:, 1]
+
+    values = np.asarray(values, dtype=float)
+    mask = np.isfinite(values)
+
+    ax.scatter(
+        x[~mask],
+        y[~mask],
+        s=spot_size,
+        c="#d9d9d9",
+        alpha=0.22,
+        linewidths=0,
+    )
+
+    if mask.sum() == 0:
+        ax.set_title(title)
+        ax.invert_yaxis()
+        ax.set_aspect("equal")
+        ax.axis("off")
+        return None
+
+    vmin, vmax = np.nanpercentile(values[mask], clip)
+
+    if center is not None:
+        lim = max(abs(vmin - center), abs(vmax - center))
+        vmin = center - lim
+        vmax = center + lim
+
+    sc = ax.scatter(
+        x[mask],
+        y[mask],
+        s=spot_size,
+        c=values[mask],
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        linewidths=0,
+    )
+
+    ax.set_title(title, fontsize=11, pad=8)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    return sc
+
+
+def plot_spatial_value(
+    adata,
+    values,
+    title="spatial value",
+    cmap="magma",
+    spot_size=18,
+    center=None,
+    figsize=(4.5, 4.2),
+):
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sc = _spatial_axes(
+        ax,
+        adata,
+        values,
+        title,
+        cmap=cmap,
+        spot_size=spot_size,
+        center=center,
+    )
+
+    if sc is not None:
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def plot_cluster_level_obs_value(
+    adata,
+    value_key,
+    group_key="ground_truth",
+    aggfunc="mean",
+    spot_size=18,
+    cmap="magma",
+    center=None,
+    figsize=(10, 4.2),
+):
+    """
+    Show:
+        1. spot-level map
+        2. cluster-level map
+        3. group mean barplot
+
+    Missing group labels are ignored.
+    """
+    if value_key not in adata.obs.columns:
+        raise ValueError(f"{value_key!r} not found in adata.obs")
+
+    if group_key not in adata.obs.columns:
+        raise ValueError(f"{group_key!r} not found in adata.obs")
+
+    labels = _valid_group_series(adata, group_key=group_key)
+    values = adata.obs[value_key].astype(float)
+
+    df = pd.DataFrame({"value": values, "group": labels}).dropna()
+
+    cluster_values = pd.Series(np.nan, index=adata.obs_names, dtype=float)
+
+    if not df.empty:
+        grouped = df.groupby("group", observed=True)["value"].agg(aggfunc)
+        valid = labels.notna()
+        cluster_values.loc[valid] = labels.loc[valid].map(grouped).astype(float)
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=figsize,
+        gridspec_kw={"width_ratios": [1, 1, 0.9]},
+    )
+
+    sc0 = _spatial_axes(
+        axes[0],
+        adata,
+        values.values,
+        f"Spot-level {value_key}",
+        cmap=cmap,
+        spot_size=spot_size,
+        center=center,
+    )
+
+    sc1 = _spatial_axes(
+        axes[1],
+        adata,
+        cluster_values.values,
+        f"Cluster-level {value_key}\n{group_key}",
+        cmap=cmap,
+        spot_size=spot_size,
+        center=center,
+    )
+
     if sc0 is not None:
         fig.colorbar(sc0, ax=axes[0], fraction=0.046, pad=0.02)
+
     if sc1 is not None:
         fig.colorbar(sc1, ax=axes[1], fraction=0.046, pad=0.02)
-    summary = pd.DataFrame({'group': labels.values, value_key: values.values}).dropna().groupby('group', observed=True)[value_key].agg(['count', 'mean', 'median', 'std']).sort_values('mean')
-    sns.barplot(data=summary.reset_index(), y='group', x='mean', ax=axes[2], color='#80b1d3', edgecolor='black', linewidth=0.4)
-    axes[2].set_xlabel(f'mean {value_key}')
-    axes[2].set_ylabel('')
-    axes[2].set_title('Mean by group', fontsize=11, pad=8)
+
+    summary = (
+        df.groupby("group", observed=True)["value"]
+        .agg(["count", "mean", "median", "std"])
+        .sort_values("mean")
+    )
+
+    sns.barplot(
+        data=summary.reset_index(),
+        y="group",
+        x="mean",
+        ax=axes[2],
+        color="#80b1d3",
+        edgecolor="black",
+        linewidth=0.4,
+    )
+
+    axes[2].set_xlabel(f"mean {value_key}")
+    axes[2].set_ylabel("")
+    axes[2].set_title("Mean by group", fontsize=11, pad=8)
+
     if center is not None:
-        axes[2].axvline(center, color='black', linewidth=1)
+        axes[2].axvline(center, color="black", linewidth=1)
+
     plt.tight_layout()
-    return (fig, axes, summary)
 
-def analyze_adar_global_atoi_relationship(adata_ai, adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), atoi_keys=('global_atoi_ratio', 'sv_atoi_score'), df_deconv=None, celltype_cols=None, covariates=None, min_complete=30, store_key='adar_global_atoi_relationship'):
-    """Test associations between ADAR-family expression and global or SV A-to-I metrics.
+    return fig, axes, summary
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-atoi_keys : object
-    A-to-I metric columns to analyze.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-covariates : object
-    Additional covariate columns to include in regression models.
-min_complete : object
-    Function argument used by this helper.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
-    atoi_keys = [k for k in atoi_keys if k in adata_ai.obs.columns]
-    covariates = [] if covariates is None else list(covariates)
-    obs_covariates = [c for c in covariates if c in adata_ai.obs.columns]
-    common = adata_ai.obs_names
-    if df_deconv is not None:
-        common = common.intersection(df_deconv.index)
-        if celltype_cols is None:
-            meta = {'in_tissue', 'x_array', 'y_array', 'x_pixel', 'y_pixel', 'celltype_sum'}
-            celltype_cols = [c for c in df_deconv.columns if c not in meta and pd.api.types.is_numeric_dtype(df_deconv[c])]
-        ct_cols = [c for c in celltype_cols if c in df_deconv.columns]
+def summarize_obs_by_group(adata, value_key, group_key="ground_truth"):
+    if value_key not in adata.obs.columns:
+        raise ValueError(f"{value_key!r} not found in adata.obs")
+
+    labels = _valid_group_series(adata, group_key=group_key)
+    values = adata.obs[value_key].astype(float)
+
+    df = pd.DataFrame({value_key: values, group_key: labels}).dropna()
+
+    return (
+        df.groupby(group_key, observed=True)[value_key]
+        .agg(["count", "mean", "median", "std"])
+        .sort_values("mean", ascending=False)
+    )
+
+
+# =============================================================================
+# 4. SV-A-to-I detection
+# =============================================================================
+
+def _safe_moran_geary(values, coords, spatial_k=6, permutations=999):
+    mask = np.isfinite(values)
+
+    if mask.sum() <= spatial_k + 2 or np.nanstd(values[mask]) == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    try:
+        from libpysal.weights import KNN
+        from esda.geary import Geary
+        from esda.moran import Moran
+
+        w = KNN.from_array(coords[mask], k=min(spatial_k, mask.sum() - 1))
+        w.transform = "R"
+
+        moran = Moran(values[mask], w, permutations=permutations)
+        geary = Geary(values[mask], w, permutations=permutations)
+
+        return float(moran.I), float(moran.p_sim), float(geary.C), float(geary.p_sim)
+
+    except Exception as exc:
+        warnings.warn(f"Moran/Geary failed; returning NaN spatial statistics: {exc}")
+        return np.nan, np.nan, np.nan, np.nan
+
+
+def detect_spatial_atoi_sites(
+    adata_ai,
+    group_key="ground_truth",
+    min_cov=10,
+    min_valid_spots=30,
+    min_total_A=30,
+    min_total_G=30,
+    min_ratio_sd=0.03,
+    spatial_k=6,
+    fdr_cutoff=0.05,
+    p_cutoff=None,
+    sv_call_by="fdr",
+    permutations=999,
+    a_layer="A",
+    g_layer="G",
+    store_key="sv_atoi",
+    verbose=True,
+):
+    """
+    Detect spatially variable A-to-I sites.
+
+    sv_call_by:
+        "fdr"    : moran_fdr < fdr_cutoff
+        "p"      : moran_p < p_cutoff
+        "either" : moran_fdr < fdr_cutoff OR moran_p < p_cutoff
+    """
+    if p_cutoff is None:
+        p_cutoff = fdr_cutoff
+
+    sv_call_by = str(sv_call_by).lower()
+
+    if sv_call_by not in ["fdr", "p", "either"]:
+        raise ValueError("sv_call_by must be one of: 'fdr', 'p', 'either'.")
+
+    coords = _coords_from_adata(adata_ai)
+
+    if group_key is not None and group_key in adata_ai.obs.columns:
+        groups = _valid_group_series(adata_ai, group_key=group_key)
     else:
-        ct_cols = []
-    df = adata_ai.obs.loc[common, atoi_keys + adar_cols + obs_covariates].copy()
-    if df_deconv is not None and ct_cols:
-        df = df.join(df_deconv.loc[common, ct_cols], how='left')
-    rows = []
-    for target in atoi_keys:
-        for adar in adar_cols:
-            sub = df[[target, adar]].dropna()
-            rho = p_spear = np.nan
-            if sub.shape[0] >= min_complete and sub[target].std() > 0 and (sub[adar].std() > 0):
-                rho, p_spear = spearmanr(sub[adar], sub[target])
-            model_cols = [adar] + ct_cols + obs_covariates
-            sub_model = df[[target] + model_cols].dropna()
-            beta = p_ols = r2 = np.nan
-            if sub_model.shape[0] >= max(min_complete, len(model_cols) + 5) and sub_model[target].std() > 0 and (sub_model[adar].std() > 0):
-                X = sub_model[model_cols].astype(float).copy()
-                for c in X.columns:
-                    sd = X[c].std()
-                    if sd > 0:
-                        X[c] = (X[c] - X[c].mean()) / sd
-                y = sub_model[target].astype(float)
-                y = (y - y.mean()) / y.std()
-                fit = sm.OLS(y, sm.add_constant(X, has_constant='add')).fit()
-                beta = float(fit.params[adar])
-                p_ols = float(fit.pvalues[adar])
-                r2 = float(fit.rsquared)
-            rows.append({'atoi_metric': target, 'adar': adar.replace('expr_', ''), 'adar_col': adar, 'n_spearman': int(sub.shape[0]), 'spearman_rho': float(rho) if np.isfinite(rho) else np.nan, 'spearman_p': float(p_spear) if np.isfinite(p_spear) else np.nan, 'n_model': int(sub_model.shape[0]), 'adjusted_beta': beta, 'adjusted_p': p_ols, 'adjusted_r2': r2})
-    res = pd.DataFrame(rows)
-    if not res.empty:
-        res['spearman_fdr'] = multipletests(res['spearman_p'].fillna(1.0), method='fdr_bh')[1]
-        res['adjusted_fdr'] = multipletests(res['adjusted_p'].fillna(1.0), method='fdr_bh')[1]
-        res = res.sort_values(['atoi_metric', 'adjusted_fdr', 'spearman_fdr']).reset_index(drop=True)
-    adata_ai.uns[store_key] = res
-    return res
+        groups = None
 
-def find_adar_associated_atoi_sites(adata_ai, adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), candidate_sites=None, min_cov=10, min_valid_spots=30, fdr_method='fdr_bh', a_layer='A', g_layer='G', store_key='adar_site_association'):
-    """Find individual A-to-I sites associated with ADAR-family expression.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-candidate_sites : object
-    Optional subset of candidate A-to-I sites to test.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-min_valid_spots : object
-    Minimum number of complete or valid spots required for analysis.
-fdr_method : object
-    Multiple-testing correction method passed to `multipletests`.
-a_layer : object
-    Name of the layer containing A counts.
-g_layer : object
-    Name of the layer containing G counts.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
-    if candidate_sites is None:
-        sites = list(adata_ai.var_names)
-    elif isinstance(candidate_sites, pd.DataFrame):
-        sites = [s for s in candidate_sites['site'].astype(str) if s in adata_ai.var_names]
-    else:
-        sites = [s for s in candidate_sites if s in adata_ai.var_names]
     A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
+
     rows = []
-    for site in sites:
-        j = adata_ai.var_names.get_loc(site)
+
+    for j, site in enumerate(adata_ai.var_names):
         a = _dense_col(A, j)
         g = _dense_col(G, j)
         cov = a + g
-        ratio = np.full(adata_ai.n_obs, np.nan)
-        valid_cov = cov >= min_cov
-        ratio[valid_cov] = g[valid_cov] / cov[valid_cov]
-        gene = adata_ai.var.loc[site].get('Gene.refGene', site)
-        for adar in adar_cols:
-            expr = adata_ai.obs[adar].astype(float).values
-            mask = np.isfinite(ratio) & np.isfinite(expr)
-            if mask.sum() < min_valid_spots or np.nanstd(ratio[mask]) == 0 or np.nanstd(expr[mask]) == 0:
-                continue
-            rho, pval = spearmanr(expr[mask], ratio[mask])
-            rows.append({'site': site, 'gene': gene, 'adar': adar.replace('expr_', ''), 'adar_col': adar, 'n_valid_spots': int(mask.sum()), 'spearman_rho': float(rho), 'spearman_p': float(pval), 'mean_ratio': float(np.nanmean(ratio[mask])), 'sd_ratio': float(np.nanstd(ratio[mask]))})
+
+        valid = cov >= min_cov
+
+        ratio = np.full(adata_ai.n_obs, np.nan, dtype=float)
+        ratio[valid] = g[valid] / cov[valid]
+
+        n_valid = int(valid.sum())
+        total_A = float(a[valid].sum())
+        total_G = float(g[valid].sum())
+
+        mean_ratio = float(np.nanmean(ratio)) if n_valid > 0 else np.nan
+        sd_ratio = float(np.nanstd(ratio)) if n_valid > 0 else np.nan
+
+        pass_qc = (
+            (n_valid >= min_valid_spots)
+            and (total_A >= min_total_A)
+            and (total_G >= min_total_G)
+            and np.isfinite(sd_ratio)
+            and (sd_ratio >= min_ratio_sd)
+        )
+
+        moran_I = moran_p = geary_C = geary_p = np.nan
+        kw_stat = kw_p = np.nan
+        group_n = 0
+
+        if pass_qc:
+            moran_I, moran_p, geary_C, geary_p = _safe_moran_geary(
+                ratio,
+                coords,
+                spatial_k=spatial_k,
+                permutations=permutations,
+            )
+
+            if groups is not None:
+                tmp = pd.DataFrame(
+                    {"ratio": ratio, "group": groups.values},
+                    index=adata_ai.obs_names,
+                ).dropna()
+
+                vals = [
+                    sub["ratio"].dropna().values
+                    for _, sub in tmp.groupby("group", observed=True)
+                ]
+                vals = [v for v in vals if len(v) >= 3]
+                group_n = len(vals)
+
+                if group_n >= 2:
+                    try:
+                        kw_stat, kw_p = kruskal(*vals)
+                        kw_stat = float(kw_stat)
+                        kw_p = float(kw_p)
+                    except Exception:
+                        kw_stat = np.nan
+                        kw_p = np.nan
+
+        gene = ""
+
+        if "Gene.refGene" in adata_ai.var.columns:
+            gene = adata_ai.var.iloc[j].get("Gene.refGene", "")
+
+        rows.append(
+            {
+                "site": site,
+                "gene": gene,
+                "n_valid_spots": n_valid,
+                "total_A_valid": total_A,
+                "total_G_valid": total_G,
+                "total_cov_valid": total_A + total_G,
+                "mean_ratio": mean_ratio,
+                "sd_ratio": sd_ratio,
+                "pass_qc": bool(pass_qc),
+                "moran_I": moran_I,
+                "moran_p": moran_p,
+                "geary_C": geary_C,
+                "geary_p": geary_p,
+                "group_key": group_key,
+                "group_n": group_n,
+                "group_kw_stat": kw_stat,
+                "group_kw_p": kw_p,
+            }
+        )
+
+        if verbose and (j + 1) % 500 == 0:
+            print(f"Processed {j + 1}/{adata_ai.n_vars} A-to-I sites")
+
     res = pd.DataFrame(rows)
-    if not res.empty:
-        res['padj'] = np.nan
-        for adar in res['adar'].unique():
-            idx = res['adar'] == adar
-            res.loc[idx, 'padj'] = multipletests(res.loc[idx, 'spearman_p'], method=fdr_method)[1]
-        res['abs_rho'] = res['spearman_rho'].abs()
-        res = res.sort_values(['adar', 'padj', 'abs_rho'], ascending=[True, True, False]).reset_index(drop=True)
-    adata_ai.uns[store_key] = res
-    return res
 
-def compute_adar_site_module_scores(adata_ai, adar_site_assoc, padj_cutoff=0.1, top_n=50, min_cov=10, score_prefix='adar_site_module'):
-    """Compute one multi-site editing module score for each ADAR-family member.
+    res["moran_fdr"] = np.nan
+    res["group_kw_fdr"] = np.nan
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-adar_site_assoc : object
-    DataFrame returned by `find_adar_associated_atoi_sites()`.
-padj_cutoff : object
-    Adjusted p-value threshold for selecting ADAR-associated sites.
-top_n : object
-    Maximum number of top-ranked sites or entries to use.
-min_cov : object
-    Minimum A+G coverage required for a spot-site observation.
-score_prefix : object
-    Prefix used for ADAR-site module score columns.
+    qc = res["pass_qc"].values
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    score_cols = []
-    if adar_site_assoc.empty:
-        return score_cols
-    for adar, df in adar_site_assoc.groupby('adar', observed=True):
-        use = df[df['padj'] <= padj_cutoff].copy()
-        if use.empty:
-            use = df.copy()
-        use = use.sort_values(['padj', 'abs_rho'], ascending=[True, False]).head(top_n)
-        sites = [s for s in use['site'] if s in adata_ai.var_names]
-        if not sites:
-            continue
-        weights = use.set_index('site').loc[sites, 'spearman_rho'].values.astype(float)
-        idx = [adata_ai.var_names.get_loc(s) for s in sites]
-        ratio_mat, _ = _site_ratio_matrix(adata_ai, idx, min_cov=min_cov)
-        z = ratio_mat.copy()
-        mu = np.nanmean(z, axis=0)
-        sd = np.nanstd(z, axis=0)
-        sd[sd == 0] = np.nan
-        z = (z - mu) / sd
-        signed_weights = np.sign(weights)
-        signed_weights[signed_weights == 0] = 1
-        valid = np.isfinite(z)
-        score = np.nansum(np.where(valid, z * signed_weights, np.nan), axis=1) / np.sum(valid, axis=1)
-        score[np.sum(valid, axis=1) == 0] = np.nan
-        col = f'{score_prefix}_{adar}'
-        adata_ai.obs[col] = score
-        adata_ai.uns[f'{col}_sites'] = sites
-        score_cols.append(col)
-    return score_cols
+    if qc.any():
+        res.loc[qc, "moran_fdr"] = _safe_multipletest(res.loc[qc, "moran_p"])
+        res.loc[qc, "group_kw_fdr"] = _safe_multipletest(res.loc[qc, "group_kw_p"])
 
-def plot_adar_global_relationship_dashboard(adata_ai, adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), atoi_keys=('global_atoi_ratio', 'sv_atoi_score'), spot_size=18, figsize=None):
-    """Plot ADAR-family expression maps and expression-versus-A-to-I scatterplots.
+    if sv_call_by == "fdr":
+        sig = res["moran_fdr"] < fdr_cutoff
+        call_text = f"Moran FDR < {fdr_cutoff}"
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-atoi_keys : object
-    A-to-I metric columns to analyze.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
+    elif sv_call_by == "p":
+        sig = res["moran_p"] < p_cutoff
+        call_text = f"Moran p < {p_cutoff}"
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
-    atoi_keys = [k for k in atoi_keys if k in adata_ai.obs.columns]
-    nrows = len(adar_cols)
-    ncols = 1 + len(atoi_keys)
-    if figsize is None:
-        figsize = (4.2 * ncols, 3.8 * nrows)
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-    for r, adar in enumerate(adar_cols):
-        gene = adar.replace('expr_', '')
-        expr = adata_ai.obs[adar].astype(float).values
-        sc = _spatial_axes(axes[r, 0], adata_ai, expr, f'{gene} expression', cmap='YlGnBu', spot_size=spot_size)
-        if sc is not None:
-            fig.colorbar(sc, ax=axes[r, 0], fraction=0.046, pad=0.02)
-        for c, metric in enumerate(atoi_keys, start=1):
-            x = expr
-            y = adata_ai.obs[metric].astype(float).values
-            mask = np.isfinite(x) & np.isfinite(y)
-            rho, pval = spearmanr(x[mask], y[mask]) if mask.sum() > 2 else (np.nan, np.nan)
-            sns.regplot(x=x[mask], y=y[mask], scatter_kws={'s': 13, 'alpha': 0.42, 'linewidth': 0}, line_kws={'color': 'black', 'linewidth': 1.3}, lowess=True, ax=axes[r, c])
-            axes[r, c].set_xlabel(f'{gene} expression')
-            axes[r, c].set_ylabel(metric)
-            axes[r, c].set_title(f'{gene} vs {metric}\\nrho={rho:.2f}, p={pval:.1e}', fontsize=10)
-    plt.tight_layout()
-    return (fig, axes)
-
-def plot_adar_site_module_overview(adata_ai, module_cols, adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), group_key='ground_truth', spot_size=18, figsize=None):
-    """Compare ADAR expression maps with ADAR-associated multi-site editing module maps.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-module_cols : object
-    ADAR-associated module score columns in `adata_ai.obs`.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
-    module_cols = [c for c in module_cols if c in adata_ai.obs.columns]
-    rows = []
-    for adar in adar_cols:
-        name = adar.replace('expr_', '')
-        module = next((m for m in module_cols if m.endswith(f'_{name}')), None)
-        if module:
-            rows.append((adar, module))
-    if not rows:
-        raise ValueError('No matching ADAR module columns found.')
-    if figsize is None:
-        figsize = (8.4, 3.8 * len(rows))
-    fig, axes = plt.subplots(len(rows), 2, figsize=figsize, squeeze=False)
-    for r, (adar, module) in enumerate(rows):
-        name = adar.replace('expr_', '')
-        sc = _spatial_axes(axes[r, 0], adata_ai, adata_ai.obs[adar].values, f'{name} expression', cmap='YlGnBu', spot_size=spot_size)
-        if sc is not None:
-            fig.colorbar(sc, ax=axes[r, 0], fraction=0.046, pad=0.02)
-        sc = _spatial_axes(axes[r, 1], adata_ai, adata_ai.obs[module].values, f'{name}-associated multi-site A-to-I', cmap='coolwarm', spot_size=spot_size, center=0)
-        if sc is not None:
-            fig.colorbar(sc, ax=axes[r, 1], fraction=0.046, pad=0.02)
-    plt.tight_layout()
-    return (fig, axes)
-
-def add_wm_indicator(adata, group_key='ground_truth', wm_label='WM', wm_key='is_WM'):
-    """Create a boolean white-matter indicator from a group annotation.
-
-Parameters
-----------
-adata : object
-    AnnData object containing spatial coordinates and observations.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-wm_label : object
-    Group label treated as white matter.
-wm_key : object
-    Boolean `.obs` column indicating white-matter spots.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if group_key not in adata.obs:
-        raise ValueError(f'{group_key!r} not found in adata.obs')
-    adata.obs[wm_key] = adata.obs[group_key].astype(str).str.upper().eq(str(wm_label).upper())
-    return adata.obs[wm_key]
-
-def summarize_wm_nonwm_atoi_adar(adata_ai, group_key='ground_truth', wm_label='WM', adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), atoi_cols=('global_atoi_ratio', 'sv_atoi_score', 'sv_atoi_residual', 'sv_atoi_residual_deconv_adar'), module_prefix='adar_site_module_', wm_key='is_WM'):
-    """Summarize ADAR expression and A-to-I metrics in WM versus non-WM spots.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-wm_label : object
-    Group label treated as white matter.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-atoi_cols : object
-    A-to-I metric columns to summarize or plot.
-module_prefix : object
-    Prefix used to identify ADAR-associated module columns.
-wm_key : object
-    Boolean `.obs` column indicating white-matter spots.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if wm_key not in adata_ai.obs:
-        add_wm_indicator(adata_ai, group_key=group_key, wm_label=wm_label, wm_key=wm_key)
-    module_cols = [c for c in adata_ai.obs.columns if c.startswith(module_prefix)]
-    value_cols = [c for c in list(adar_cols) + list(atoi_cols) + module_cols if c in adata_ai.obs.columns]
-    rows = []
-    for col in value_cols:
-        wm = adata_ai.obs.loc[adata_ai.obs[wm_key], col].astype(float).dropna()
-        nonwm = adata_ai.obs.loc[~adata_ai.obs[wm_key], col].astype(float).dropna()
-        if len(wm) == 0 or len(nonwm) == 0:
-            continue
-        stat, pval = mannwhitneyu(wm, nonwm, alternative='two-sided')
-        rows.append({'feature': col, 'n_WM': int(len(wm)), 'n_nonWM': int(len(nonwm)), 'mean_WM': float(wm.mean()), 'mean_nonWM': float(nonwm.mean()), 'median_WM': float(wm.median()), 'median_nonWM': float(nonwm.median()), 'delta_mean_WM_minus_nonWM': float(wm.mean() - nonwm.mean()), 'mannwhitney_p': float(pval)})
-    res = pd.DataFrame(rows)
-    if not res.empty:
-        res['padj'] = multipletests(res['mannwhitney_p'], method='fdr_bh')[1]
-        res = res.sort_values(['padj', 'feature']).reset_index(drop=True)
-    adata_ai.uns['wm_nonwm_atoi_adar_summary'] = res
-    return res
-
-def analyze_wm_adar_interaction(adata_ai, target_cols=('global_atoi_ratio', 'sv_atoi_score'), adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), wm_key='is_WM', df_deconv=None, celltype_cols=None, covariates=None, min_complete=30, store_key='wm_adar_interaction'):
-    """Fit ADAR-by-WM interaction models for A-to-I metrics.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-target_cols : object
-    A-to-I metric columns used as regression outcomes.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-wm_key : object
-    Boolean `.obs` column indicating white-matter spots.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-covariates : object
-    Additional covariate columns to include in regression models.
-min_complete : object
-    Function argument used by this helper.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if wm_key not in adata_ai.obs:
-        raise ValueError(f'{wm_key!r} not found in adata_ai.obs')
-    target_cols = [c for c in target_cols if c in adata_ai.obs.columns]
-    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
-    covariates = [] if covariates is None else list(covariates)
-    obs_covariates = [c for c in covariates if c in adata_ai.obs.columns]
-    common = adata_ai.obs_names
-    if df_deconv is not None:
-        common = common.intersection(df_deconv.index)
-        if celltype_cols is None:
-            meta = {'in_tissue', 'x_array', 'y_array', 'x_pixel', 'y_pixel', 'celltype_sum'}
-            celltype_cols = [c for c in df_deconv.columns if c not in meta and pd.api.types.is_numeric_dtype(df_deconv[c])]
-        ct_cols = [c for c in celltype_cols if c in df_deconv.columns]
     else:
-        ct_cols = []
-    base_cols = target_cols + adar_cols + [wm_key] + obs_covariates
-    df = adata_ai.obs.loc[common, base_cols].copy()
-    if df_deconv is not None and ct_cols:
-        df = df.join(df_deconv.loc[common, ct_cols], how='left')
-    rows = []
-    for target in target_cols:
-        for adar in adar_cols:
-            model_cols = [adar, wm_key] + ct_cols + obs_covariates
-            sub = df[[target] + model_cols].dropna().copy()
-            if sub.shape[0] < max(min_complete, len(model_cols) + 6):
-                continue
-            sub[wm_key] = sub[wm_key].astype(float)
-            adar_z = sub[adar].astype(float)
-            if adar_z.std() == 0 or sub[target].astype(float).std() == 0:
-                continue
-            sub[adar] = (adar_z - adar_z.mean()) / adar_z.std()
-            interaction_col = f'{adar}:WM'
-            sub[interaction_col] = sub[adar] * sub[wm_key]
-            X_cols = [adar, wm_key, interaction_col] + ct_cols + obs_covariates
-            X = sub[X_cols].astype(float).copy()
-            for c in ct_cols + obs_covariates:
-                sd = X[c].std()
-                if sd > 0:
-                    X[c] = (X[c] - X[c].mean()) / sd
-            y = sub[target].astype(float)
-            y = (y - y.mean()) / y.std()
-            fit = sm.OLS(y, sm.add_constant(X, has_constant='add')).fit()
-            rows.append({'target': target, 'adar': adar.replace('expr_', ''), 'n_spots': int(sub.shape[0]), 'beta_adar_nonWM': float(fit.params[adar]), 'p_adar_nonWM': float(fit.pvalues[adar]), 'beta_WM_shift': float(fit.params[wm_key]), 'p_WM_shift': float(fit.pvalues[wm_key]), 'beta_adar_x_WM': float(fit.params[interaction_col]), 'p_adar_x_WM': float(fit.pvalues[interaction_col]), 'r2': float(fit.rsquared)})
-    res = pd.DataFrame(rows)
-    if not res.empty:
-        res['padj_adar_x_WM'] = multipletests(res['p_adar_x_WM'], method='fdr_bh')[1]
-        res = res.sort_values(['target', 'padj_adar_x_WM']).reset_index(drop=True)
+        sig = (res["moran_fdr"] < fdr_cutoff) | (res["moran_p"] < p_cutoff)
+        call_text = f"Moran FDR < {fdr_cutoff} OR Moran p < {p_cutoff}"
+
+    res["is_sv_atoi"] = (
+        res["pass_qc"]
+        & (res["moran_I"] > 0)
+        & sig.fillna(False)
+    )
+
+    res["sv_call_by"] = sv_call_by
+    res["fdr_cutoff"] = fdr_cutoff
+    res["p_cutoff"] = p_cutoff
+
+    res = res.sort_values(
+        ["is_sv_atoi", "moran_fdr", "moran_p", "moran_I"],
+        ascending=[False, True, True, False],
+    ).reset_index(drop=True)
+
     adata_ai.uns[store_key] = res
+
+    if verbose:
+        print(f"QC-passing sites: {int(res['pass_qc'].sum())}")
+        print(f"SV-A-to-I sites ({call_text}): {int(res['is_sv_atoi'].sum())}")
+
     return res
 
-def plot_wm_adar_program_summary(adata_ai, group_key='ground_truth', wm_label='WM', wm_key='is_WM', adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), module_cols=None, atoi_cols=('global_atoi_ratio', 'sv_atoi_score'), spot_size=18, figsize=None):
-    """Create a spatial and boxplot summary of WM/non-WM ADAR-A-to-I programs.
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-wm_label : object
-    Group label treated as white matter.
-wm_key : object
-    Boolean `.obs` column indicating white-matter spots.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-module_cols : object
-    ADAR-associated module score columns in `adata_ai.obs`.
-atoi_cols : object
-    A-to-I metric columns to summarize or plot.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
+def plot_sv_atoi_discovery_landscape(
+    sv_atoi: pd.DataFrame,
+    fdr_cutoff=0.05,
+    top_n_labels=8,
+    figsize=(12, 4),
+):
+    df = sv_atoi.copy()
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if wm_key not in adata_ai.obs:
-        add_wm_indicator(adata_ai, group_key=group_key, wm_label=wm_label, wm_key=wm_key)
-    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
-    if module_cols is None:
-        module_cols = [c for c in adata_ai.obs.columns if c.startswith('adar_site_module_')]
-    module_cols = [c for c in module_cols if c in adata_ai.obs.columns]
-    atoi_cols = [c for c in atoi_cols if c in adata_ai.obs.columns]
-    map_cols = adar_cols + module_cols + atoi_cols
-    n_maps = min(len(map_cols), 8)
+    df["neglog10_fdr"] = -np.log10(df["moran_fdr"].clip(lower=1e-300))
+    df["status"] = np.where(df["is_sv_atoi"], "SV-A-to-I", "not SV")
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    counts = pd.Series(
+        {
+            "all sites": len(df),
+            "QC pass": int(df["pass_qc"].sum()),
+            "SV-A-to-I": int(df["is_sv_atoi"].sum()),
+        }
+    )
+
+    sns.barplot(x=counts.index, y=counts.values, ax=axes[0])
+    axes[0].set_ylabel("site count")
+    axes[0].set_xlabel("")
+    axes[0].set_title("Discovery funnel")
+    axes[0].tick_params(axis="x", rotation=25)
+
+    colors = df["status"].map({"not SV": "#bdbdbd", "SV-A-to-I": "#d95f02"})
+    sizes = np.clip(df["n_valid_spots"].astype(float) / 3, 12, 90)
+
+    mask = df["moran_I"].notna() & df["neglog10_fdr"].notna()
+
+    axes[1].scatter(
+        df.loc[mask, "moran_I"],
+        df.loc[mask, "neglog10_fdr"],
+        s=sizes.loc[mask],
+        c=colors.loc[mask],
+        linewidths=0,
+        alpha=0.75,
+    )
+
+    axes[1].axhline(-np.log10(fdr_cutoff), color="black", linestyle="--", linewidth=1)
+    axes[1].axvline(0, color="black", linewidth=0.8)
+    axes[1].set_xlabel("Moran's I")
+    axes[1].set_ylabel("-log10(FDR)")
+    axes[1].set_title("Spatial autocorrelation")
+
+    label_df = (
+        df.sort_values(
+            ["is_sv_atoi", "moran_fdr", "moran_I"],
+            ascending=[False, True, False],
+        )
+        .head(top_n_labels)
+    )
+
+    for _, row in label_df.iterrows():
+        label = row["gene"] if isinstance(row.get("gene", ""), str) and row.get("gene", "") else row["site"]
+
+        if np.isfinite(row["moran_I"]) and np.isfinite(row["neglog10_fdr"]):
+            axes[1].text(
+                row["moran_I"],
+                row["neglog10_fdr"],
+                str(label)[:14],
+                fontsize=7,
+            )
+
+    colors2 = df["status"].map({"not SV": "#bdbdbd", "SV-A-to-I": "#7570b3"})
+    mask = df["n_valid_spots"].notna() & df["sd_ratio"].notna()
+
+    axes[2].scatter(
+        df.loc[mask, "n_valid_spots"],
+        df.loc[mask, "sd_ratio"],
+        c=colors2.loc[mask],
+        s=28,
+        linewidths=0,
+        alpha=0.75,
+    )
+
+    axes[2].set_xlabel("valid spots")
+    axes[2].set_ylabel("editing ratio SD")
+    axes[2].set_title("Coverage and variability")
+
+    plt.tight_layout()
+
+    return fig, axes
+
+
+def plot_top_sv_site_patterns(
+    adata_ai,
+    sv_atoi,
+    group_key="ground_truth",
+    top_n=6,
+    min_cov=10,
+    mode="cluster",
+    spot_size=16,
+    cmap="magma",
+    figsize=None,
+):
+    """
+    Plot top SV-A-to-I sites as spot-level or cluster-level editing-ratio maps.
+    """
+    mode = str(mode).lower()
+
+    if mode not in ["spot", "cluster"]:
+        raise ValueError("mode must be 'spot' or 'cluster'.")
+
+    df = sv_atoi.copy()
+
+    if "is_sv_atoi" in df.columns:
+        df = df[df["is_sv_atoi"] == True].copy()
+
+    if df.empty:
+        raise ValueError("No SV-A-to-I sites available for plotting.")
+
+    sites = [s for s in df["site"].head(top_n).astype(str) if s in adata_ai.var_names]
+
+    if not sites:
+        raise ValueError("No top SV-A-to-I sites found in adata_ai.var_names.")
+
+    ncols = min(3, len(sites))
+    nrows = int(np.ceil(len(sites) / ncols))
+
     if figsize is None:
-        figsize = (4.0 * min(n_maps, 4), 3.8 * (int(np.ceil(n_maps / 4)) + 1))
-    ncols = min(4, max(1, n_maps))
-    nrows = int(np.ceil(n_maps / ncols)) + 1
+        figsize = (4.1 * ncols, 4.0 * nrows)
+
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
     axes = np.atleast_1d(axes).ravel()
-    wm_numeric = adata_ai.obs[wm_key].astype(float).values
-    _spatial_axes(axes[0], adata_ai, wm_numeric, f'{wm_label} indicator', cmap='Greys', spot_size=spot_size, clip=(0, 100))
-    for ax, col in zip(axes[1:n_maps], map_cols[:max(0, n_maps - 1)]):
-        cmap = 'YlGnBu' if col.startswith('expr_') else 'coolwarm' if 'module' in col or 'score' in col else 'magma'
-        center = 0 if cmap == 'coolwarm' else None
-        _spatial_axes(ax, adata_ai, adata_ai.obs[col].values, col, cmap=cmap, spot_size=spot_size, center=center)
-    box_ax = axes[n_maps] if n_maps < len(axes) else axes[-1]
-    plot_cols = adar_cols + module_cols + atoi_cols
-    df = adata_ai.obs[[wm_key] + plot_cols].copy()
-    df['region'] = np.where(df[wm_key], wm_label, f'non-{wm_label}')
-    melt = df.melt(id_vars='region', value_vars=plot_cols, var_name='feature', value_name='value').dropna()
-    sns.boxplot(data=melt, x='feature', y='value', hue='region', showfliers=False, ax=box_ax)
-    box_ax.tick_params(axis='x', rotation=45)
-    box_ax.set_xlabel('')
-    box_ax.set_title(f'{wm_label} vs non-{wm_label}')
-    for ax in axes[n_maps + 1:]:
-        ax.axis('off')
-    plt.tight_layout()
-    return (fig, axes)
 
-def analyze_adar_atoi_association(adata_ai, adata_expr, score_key='sv_atoi_score', genes=('ADAR', 'ADARB1', 'ADARB2'), df_deconv=None, celltype_cols=None, covariates=None, expr_prefix='expr_', layer=None, log1p=False, min_complete=30, store_key='adar_atoi_association'):
-    """Test whether ADAR-family expression explains a selected SV-A-to-I score.
-
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-adata_expr : object
-    AnnData object containing gene expression values.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-genes : object
-    Gene symbols to copy from expression AnnData.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-covariates : object
-    Additional covariate columns to include in regression models.
-expr_prefix : object
-    Prefix added to expression columns copied into `adata_ai.obs`.
-layer : object
-    Optional expression layer to use instead of `.X`.
-log1p : object
-    Whether to apply log1p transformation to copied expression values.
-min_complete : object
-    Function argument used by this helper.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
-
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    added_cols = add_gene_expression_to_obs(adata_expr=adata_expr, target_adata=adata_ai, genes=genes, prefix=expr_prefix, layer=layer, log1p=log1p)
-    if not added_cols:
-        raise ValueError('None of the requested ADAR-family genes were found in adata_expr.var_names.')
-    covariates = [] if covariates is None else list(covariates)
-    model_covariates = [c for c in covariates if c in adata_ai.obs.columns]
-    common = adata_ai.obs_names
-    if df_deconv is not None:
-        common = common.intersection(df_deconv.index)
-    df = adata_ai.obs.loc[common, [score_key] + added_cols + model_covariates].copy()
-    if df_deconv is not None:
-        if celltype_cols is None:
-            meta = {'in_tissue', 'x_array', 'y_array', 'x_pixel', 'y_pixel', 'celltype_sum'}
-            celltype_cols = [c for c in df_deconv.columns if c not in meta and pd.api.types.is_numeric_dtype(df_deconv[c])]
-        ct_cols = [c for c in celltype_cols if c in df_deconv.columns]
-        df = df.join(df_deconv.loc[common, ct_cols], how='left')
+    if mode == "cluster":
+        labels = _valid_group_series(adata_ai, group_key=group_key)
     else:
-        ct_cols = []
-    rows = []
-    for gene_col in added_cols:
-        base_cols = [score_key, gene_col]
-        sub = df.loc[:, base_cols].dropna()
-        if sub.shape[0] >= min_complete and sub[gene_col].std() > 0 and (sub[score_key].std() > 0):
-            from scipy.stats import spearmanr
-            rho, p_spear = spearmanr(sub[gene_col], sub[score_key])
+        labels = None
+
+    for ax, site in zip(axes, sites):
+        ratio = get_site_editing_ratio(adata_ai, site, min_cov=min_cov)
+
+        if mode == "cluster":
+            values = _map_group_mean_to_spots(ratio, labels)
         else:
-            rho, p_spear = (np.nan, np.nan)
-        model_cols = [gene_col] + ct_cols + model_covariates
-        sub_model = df.loc[:, [score_key] + model_cols].dropna()
+            values = ratio.values
+
+        if site in adata_ai.var.index and "Gene.refGene" in adata_ai.var.columns:
+            gene = adata_ai.var.loc[site].get("Gene.refGene", site)
+        else:
+            gene = site
+
+        sc = _spatial_axes(
+            ax,
+            adata_ai,
+            values,
+            f"{gene}\n{site}",
+            cmap=cmap,
+            spot_size=spot_size,
+        )
+
+        if sc is not None:
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+
+    for ax in axes[len(sites):]:
+        ax.axis("off")
+
+    fig.suptitle(
+        f"Top SV-A-to-I single-site editing ratios ({mode})",
+        y=1.02,
+        fontsize=13,
+    )
+
+    plt.tight_layout()
+
+    return fig, axes
+
+
+# =============================================================================
+# 6. ADAR-family expression
+# =============================================================================
+
+def add_gene_expression_to_obs(
+    adata_expr,
+    target_adata,
+    genes=("ADAR", "ADARB1", "ADARB2"),
+    prefix="expr_",
+    layer=None,
+    log1p: bool = False,
+):
+    """
+    Copy selected gene expression columns from expression AnnData into target AnnData obs.
+    """
+    common = target_adata.obs_names.intersection(adata_expr.obs_names)
+
+    added = []
+
+    for gene in genes:
+        if gene not in adata_expr.var_names:
+            warnings.warn(f"{gene!r} not found in expression var_names; skipped.")
+            continue
+
+        x = adata_expr[common, gene].layers[layer] if layer is not None else adata_expr[common, gene].X
+
+        values = x.toarray().ravel() if hasattr(x, "toarray") else np.asarray(x).ravel()
+        values = values.astype(float)
+
+        if log1p:
+            values = np.log1p(values)
+
+        col = f"{prefix}{gene}"
+
+        target_adata.obs[col] = np.nan
+        target_adata.obs.loc[common, col] = values
+
+        added.append(col)
+
+    return added
+
+
+def analyze_adar_spatial_correlation(
+    adata_ai,
+    adar_cols=("expr_ADAR", "expr_ADARB1", "expr_ADARB2"),
+    group_key="ground_truth",
+    method="spearman",
+    cluster_agg="mean",
+    min_cluster_groups=3,
+    store_key="adar_spatial_correlation",
+):
+    """
+    Compute ADAR-family spatial correlations at both spot level and cluster level.
+
+    Returns dict:
+        spot_corr
+        spot_p
+        cluster_mean
+        cluster_corr
+        cluster_p
+        pairwise
+    """
+    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
+
+    if len(adar_cols) < 2:
+        raise ValueError(f"At least two ADAR expression columns are required. Found: {adar_cols}")
+
+    method = str(method).lower()
+    cluster_agg = str(cluster_agg).lower()
+
+    if method not in ["spearman", "pearson"]:
+        raise ValueError("method must be 'spearman' or 'pearson'.")
+
+    if cluster_agg not in ["mean", "median"]:
+        raise ValueError("cluster_agg must be 'mean' or 'median'.")
+
+    spot_df = adata_ai.obs[adar_cols].astype(float).copy()
+
+    spot_corr = pd.DataFrame(np.nan, index=adar_cols, columns=adar_cols)
+    spot_p = pd.DataFrame(np.nan, index=adar_cols, columns=adar_cols)
+
+    rows = []
+
+    for i, col1 in enumerate(adar_cols):
+        for j, col2 in enumerate(adar_cols):
+            if i == j:
+                spot_corr.loc[col1, col2] = 1.0
+                spot_p.loc[col1, col2] = 0.0
+
+            elif i < j:
+                rho, pval, n = _safe_corr(spot_df[col1], spot_df[col2], method=method)
+
+                spot_corr.loc[col1, col2] = rho
+                spot_corr.loc[col2, col1] = rho
+
+                spot_p.loc[col1, col2] = pval
+                spot_p.loc[col2, col1] = pval
+
+                rows.append(
+                    {
+                        "level": "spot",
+                        "gene1": col1.replace("expr_", ""),
+                        "gene2": col2.replace("expr_", ""),
+                        "col1": col1,
+                        "col2": col2,
+                        "n": n,
+                        "correlation": rho,
+                        "pval": pval,
+                        "method": method,
+                        "cluster_agg": np.nan,
+                    }
+                )
+
+    if group_key in adata_ai.obs.columns:
+        labels = _valid_group_series(adata_ai, group_key=group_key)
+
+        cluster_df = spot_df.copy()
+        cluster_df[group_key] = labels
+        cluster_df = cluster_df.dropna(subset=[group_key])
+
+        if cluster_agg == "mean":
+            cluster_mean = cluster_df.groupby(group_key, observed=True)[adar_cols].mean()
+        else:
+            cluster_mean = cluster_df.groupby(group_key, observed=True)[adar_cols].median()
+
+        cluster_corr = pd.DataFrame(np.nan, index=adar_cols, columns=adar_cols)
+        cluster_p = pd.DataFrame(np.nan, index=adar_cols, columns=adar_cols)
+
+        for i, col1 in enumerate(adar_cols):
+            for j, col2 in enumerate(adar_cols):
+                if i == j:
+                    cluster_corr.loc[col1, col2] = 1.0
+                    cluster_p.loc[col1, col2] = 0.0
+
+                elif i < j:
+                    sub = cluster_mean[[col1, col2]].dropna()
+
+                    if sub.shape[0] >= min_cluster_groups:
+                        rho, pval, n = _safe_corr(sub[col1], sub[col2], method=method)
+                    else:
+                        rho, pval, n = np.nan, np.nan, int(sub.shape[0])
+
+                    cluster_corr.loc[col1, col2] = rho
+                    cluster_corr.loc[col2, col1] = rho
+
+                    cluster_p.loc[col1, col2] = pval
+                    cluster_p.loc[col2, col1] = pval
+
+                    rows.append(
+                        {
+                            "level": "cluster",
+                            "gene1": col1.replace("expr_", ""),
+                            "gene2": col2.replace("expr_", ""),
+                            "col1": col1,
+                            "col2": col2,
+                            "n": n,
+                            "correlation": rho,
+                            "pval": pval,
+                            "method": method,
+                            "cluster_agg": cluster_agg,
+                        }
+                    )
+
+    else:
+        cluster_mean = pd.DataFrame()
+        cluster_corr = pd.DataFrame()
+        cluster_p = pd.DataFrame()
+
+    pairwise = pd.DataFrame(rows)
+
+    if not pairwise.empty:
+        pairwise["fdr"] = np.nan
+
+        for level in pairwise["level"].dropna().unique():
+            idx = pairwise["level"] == level
+            pairwise.loc[idx, "fdr"] = _safe_multipletest(pairwise.loc[idx, "pval"])
+
+        pairwise = pairwise.sort_values(
+            ["level", "fdr", "correlation"],
+            ascending=[True, True, False],
+        ).reset_index(drop=True)
+
+    out = {
+        "spot_corr": spot_corr,
+        "spot_p": spot_p,
+        "cluster_mean": cluster_mean,
+        "cluster_corr": cluster_corr,
+        "cluster_p": cluster_p,
+        "pairwise": pairwise,
+    }
+
+    adata_ai.uns[store_key] = out
+
+    return out
+
+
+def plot_adar_correlation_heatmaps(
+    corr_result,
+    figsize=(8.5, 3.8),
+    cmap="vlag",
+    vmin=-1,
+    vmax=1,
+):
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    spot_corr = corr_result.get("spot_corr", pd.DataFrame())
+    cluster_corr = corr_result.get("cluster_corr", pd.DataFrame())
+
+    if spot_corr.empty:
+        axes[0].axis("off")
+        axes[0].set_title("Spot-level ADAR correlation\n(empty)")
+    else:
+        sns.heatmap(
+            spot_corr,
+            annot=True,
+            fmt=".2f",
+            cmap=cmap,
+            center=0,
+            vmin=vmin,
+            vmax=vmax,
+            square=True,
+            ax=axes[0],
+            cbar_kws={"shrink": 0.7},
+        )
+        axes[0].set_title("Spot-level ADAR correlation")
+
+    if cluster_corr.empty:
+        axes[1].axis("off")
+        axes[1].set_title("Cluster-level ADAR correlation\n(empty)")
+    else:
+        sns.heatmap(
+            cluster_corr,
+            annot=True,
+            fmt=".2f",
+            cmap=cmap,
+            center=0,
+            vmin=vmin,
+            vmax=vmax,
+            square=True,
+            ax=axes[1],
+            cbar_kws={"shrink": 0.7},
+        )
+        axes[1].set_title("Cluster-level ADAR correlation")
+
+    plt.tight_layout()
+
+    return fig, axes
+
+
+def plot_cluster_adar_correlation_heatmap(
+    corr_result,
+    figsize=(4.6, 4.0),
+    cmap="vlag",
+    vmin=-1,
+    vmax=1,
+    title="ADAR-family cluster-level correlation",
+):
+    """
+    Plot only the cluster-level ADAR-family correlation heatmap.
+    """
+    cluster_corr = corr_result.get("cluster_corr", pd.DataFrame())
+
+    if cluster_corr.empty:
+        raise ValueError("cluster_corr is empty.")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sns.heatmap(
+        cluster_corr,
+        annot=True,
+        fmt=".2f",
+        cmap=cmap,
+        center=0,
+        vmin=vmin,
+        vmax=vmax,
+        square=True,
+        ax=ax,
+        cbar_kws={"shrink": 0.75},
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+
+    plt.tight_layout()
+
+    return fig, ax
+
+
+# =============================================================================
+# 8. Global A-to-I vs ADAR-family expression
+# =============================================================================
+
+def analyze_score_vs_adar(
+    adata_ai,
+    score_key="global_atoi_score",
+    adar_cols=("expr_ADAR", "expr_ADARB1", "expr_ADARB2"),
+    covariates=("x_pixel", "y_pixel"),
+    group_key="ground_truth",
+    min_complete=30,
+    store_key="global_atoi_vs_adar",
+):
+    """
+    Analyze global A-to-I score versus ADAR-family expression.
+
+    Includes:
+        spot-level Spearman
+        spot-level OLS adjusted for spatial covariates
+        cluster-level Spearman
+    """
+    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
+    covariates = [c for c in covariates if c in adata_ai.obs.columns]
+
+    rows = []
+
+    df = adata_ai.obs[[score_key] + adar_cols + covariates].copy()
+
+    for adar in adar_cols:
+        sub = df[[score_key, adar]].dropna()
+
+        rho, p_spear, n_spear = _safe_corr(sub[adar], sub[score_key], method="spearman")
+
+        model_cols = [adar] + covariates
+        subm = df[[score_key] + model_cols].dropna()
+
         beta = p_ols = r2 = np.nan
-        if sub_model.shape[0] >= max(min_complete, len(model_cols) + 5) and sub_model[gene_col].std() > 0:
-            X = sub_model[model_cols].astype(float).copy()
-            for c in X.columns:
-                sd = X[c].std()
-                if sd > 0:
-                    X[c] = (X[c] - X[c].mean()) / sd
-            y = sub_model[score_key].astype(float)
-            if y.std() > 0:
-                y = (y - y.mean()) / y.std()
-                fit = sm.OLS(y, sm.add_constant(X, has_constant='add')).fit()
-                beta = float(fit.params[gene_col])
-                p_ols = float(fit.pvalues[gene_col])
-                r2 = float(fit.rsquared)
-        rows.append({'gene': gene_col.replace(expr_prefix, ''), 'expr_col': gene_col, 'n_spearman': int(sub.shape[0]), 'spearman_rho': float(rho) if np.isfinite(rho) else np.nan, 'spearman_p': float(p_spear) if np.isfinite(p_spear) else np.nan, 'n_model': int(sub_model.shape[0]), 'adjusted_beta': beta, 'adjusted_p': p_ols, 'adjusted_r2': r2, 'adjusted_for_celltypes': bool(len(ct_cols) > 0), 'celltype_cols': ct_cols, 'covariates': model_covariates})
+
+        if (
+            subm.shape[0] >= max(min_complete, len(model_cols) + 5)
+            and subm[score_key].std() > 0
+            and subm[adar].std() > 0
+        ):
+            X = _zscore_frame(subm[model_cols])
+            y = subm[score_key].astype(float)
+            y = (y - y.mean()) / y.std()
+
+            fit = sm.OLS(y, sm.add_constant(X, has_constant="add")).fit()
+
+            beta = float(fit.params[adar])
+            p_ols = float(fit.pvalues[adar])
+            r2 = float(fit.rsquared)
+
+        rows.append(
+            {
+                "level": "spot",
+                "score": score_key,
+                "adar": adar.replace("expr_", ""),
+                "adar_col": adar,
+                "n": n_spear,
+                "spearman_rho": rho,
+                "spearman_p": p_spear,
+                "adjusted_beta": beta,
+                "adjusted_p": p_ols,
+                "adjusted_r2": r2,
+            }
+        )
+
+    if group_key in adata_ai.obs.columns:
+        labels = _valid_group_series(adata_ai, group_key=group_key)
+
+        cluster_df = adata_ai.obs[[score_key] + adar_cols].copy()
+        cluster_df[group_key] = labels
+        cluster_df = cluster_df.dropna(subset=[group_key])
+
+        cluster_mean = cluster_df.groupby(group_key, observed=True)[[score_key] + adar_cols].mean()
+
+        for adar in adar_cols:
+            sub = cluster_mean[[score_key, adar]].dropna()
+            rho, pval, n = _safe_corr(sub[adar], sub[score_key], method="spearman")
+
+            rows.append(
+                {
+                    "level": "cluster",
+                    "score": score_key,
+                    "adar": adar.replace("expr_", ""),
+                    "adar_col": adar,
+                    "n": n,
+                    "spearman_rho": rho,
+                    "spearman_p": pval,
+                    "adjusted_beta": np.nan,
+                    "adjusted_p": np.nan,
+                    "adjusted_r2": np.nan,
+                }
+            )
+
     res = pd.DataFrame(rows)
+
     if not res.empty:
-        res['spearman_fdr'] = multipletests(res['spearman_p'].fillna(1.0), method='fdr_bh')[1]
-        res['adjusted_fdr'] = multipletests(res['adjusted_p'].fillna(1.0), method='fdr_bh')[1]
-        res = res.sort_values(['adjusted_fdr', 'spearman_fdr']).reset_index(drop=True)
+        res["spearman_fdr"] = _safe_multipletest(res["spearman_p"])
+        res["adjusted_fdr"] = _safe_multipletest(res["adjusted_p"])
+
     adata_ai.uns[store_key] = res
-    return (res, added_cols)
 
-def compute_atoi_residual_after_deconv_adar(adata_ai, df_deconv=None, score_key='sv_atoi_score', celltype_cols=None, adar_cols=('expr_ADAR', 'expr_ADARB1', 'expr_ADARB2'), covariates=None, residual_key='sv_atoi_residual_deconv_adar', spatial_k=6, store_key='atoi_residual_deconv_adar_model'):
-    """Compute A-to-I residuals after adjusting for cell types and ADAR-family expression.
+    return res
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-df_deconv : object
-    DataFrame of deconvolved cell-type proportions indexed by spot barcode.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-celltype_cols : object
-    Cell-type proportion columns to use as predictors or annotations.
-adar_cols : object
-    ADAR-family expression columns available in `adata_ai.obs`.
-covariates : object
-    Additional covariate columns to include in regression models.
-residual_key : object
-    Name of the residual column written to `adata_ai.obs`.
-spatial_k : object
-    Number of nearest neighbors used for spatial autocorrelation statistics.
-store_key : object
-    Key used to save result tables or summaries in `adata_ai.uns`.
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    available_adar = [c for c in adar_cols if c in adata_ai.obs.columns]
-    covariates = [] if covariates is None else list(covariates)
-    return compute_atoi_residual_after_deconv(adata_ai=adata_ai, df_deconv=df_deconv, score_key=score_key, celltype_cols=celltype_cols, covariates=available_adar + covariates, residual_key=residual_key, spatial_k=spatial_k, store_key=store_key)
+def plot_score_vs_adar_dashboard(
+    adata_ai,
+    score_key="global_atoi_score",
+    adar_cols=("expr_ADAR", "expr_ADARB1", "expr_ADARB2"),
+    spot_size=18,
+    figsize=None,
+):
+    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
 
-def plot_adar_atoi_dashboard(adata_ai, adata_expr=None, gene='ADAR', score_key='sv_atoi_score', residual_key='sv_atoi_residual_deconv_adar', expr_col=None, spot_size=18, figsize=(13.5, 4)):
-    """Plot ADAR expression, A-to-I score, adjusted residuals, and their scatter relationship.
+    nrows = len(adar_cols)
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-adata_expr : object
-    AnnData object containing gene expression values.
-gene : object
-    Single ADAR-family gene symbol for plotting.
-score_key : object
-    Name of the A-to-I score column in `adata_ai.obs`.
-residual_key : object
-    Name of the residual column written to `adata_ai.obs`.
-expr_col : object
-    Existing expression column name to use for plotting.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
+    if figsize is None:
+        figsize = (12, 3.8 * nrows)
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if expr_col is None:
-        expr_col = f'expr_{gene}'
-    if expr_col not in adata_ai.obs:
-        if adata_expr is None:
-            raise ValueError(f'{expr_col!r} not found in adata_ai.obs and adata_expr was not provided.')
-        add_gene_expression_to_obs(adata_expr, adata_ai, genes=(gene,), prefix='expr_')
-    if expr_col not in adata_ai.obs:
-        raise ValueError(f'{gene!r} was not found in expression data.')
-    expr = adata_ai.obs[expr_col].astype(float).values
-    score = adata_ai.obs[score_key].astype(float).values
-    ncols = 4 if residual_key in adata_ai.obs else 3
-    fig, axes = plt.subplots(1, ncols, figsize=figsize)
-    axes = np.atleast_1d(axes)
-    sc = _spatial_axes(axes[0], adata_ai, expr, f'{gene} expression', cmap='YlGnBu', spot_size=spot_size)
+    fig, axes = plt.subplots(nrows, 3, figsize=figsize, squeeze=False)
+
+    for r, adar in enumerate(adar_cols):
+        gene = adar.replace("expr_", "")
+
+        expr = adata_ai.obs[adar].astype(float).values
+        score = adata_ai.obs[score_key].astype(float).values
+
+        sc = _spatial_axes(
+            axes[r, 0],
+            adata_ai,
+            expr,
+            f"{gene} expression",
+            cmap="YlGnBu",
+            spot_size=spot_size,
+        )
+        if sc is not None:
+            fig.colorbar(sc, ax=axes[r, 0], fraction=0.046, pad=0.02)
+
+        sc = _spatial_axes(
+            axes[r, 1],
+            adata_ai,
+            score,
+            score_key,
+            cmap="magma",
+            spot_size=spot_size,
+        )
+        if sc is not None:
+            fig.colorbar(sc, ax=axes[r, 1], fraction=0.046, pad=0.02)
+
+        mask = np.isfinite(expr) & np.isfinite(score)
+
+        if mask.sum() > 2:
+            rho, pval = spearmanr(expr[mask], score[mask])
+        else:
+            rho, pval = np.nan, np.nan
+
+        sns.regplot(
+            x=expr[mask],
+            y=score[mask],
+            scatter_kws={"s": 14, "alpha": 0.45, "linewidth": 0},
+            line_kws={"color": "black", "linewidth": 1.2},
+            lowess=True,
+            ax=axes[r, 2],
+        )
+
+        axes[r, 2].set_xlabel(f"{gene} expression")
+        axes[r, 2].set_ylabel(score_key)
+        axes[r, 2].set_title(f"rho={rho:.2f}, p={pval:.1e}")
+
+    plt.tight_layout()
+
+    return fig, axes
+
+
+# =============================================================================
+# 9. Bivariate co-localization
+# =============================================================================
+
+def _bivariate_classes(x, y, q=0.5):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+
+    out = np.full(len(x), np.nan)
+
+    if mask.sum() == 0:
+        return out
+
+    x_cut = np.nanquantile(x[mask], q)
+    y_cut = np.nanquantile(y[mask], q)
+
+    x_hi = x >= x_cut
+    y_hi = y >= y_cut
+
+    out[mask & ~x_hi & ~y_hi] = 0
+    out[mask & x_hi & ~y_hi] = 1
+    out[mask & ~x_hi & y_hi] = 2
+    out[mask & x_hi & y_hi] = 3
+
+    return out
+
+
+def _prepare_bivariate_values(
+    adata,
+    x_values,
+    y_values,
+    mode="spot",
+    group_key="ground_truth",
+):
+    x = pd.Series(np.asarray(x_values, dtype=float), index=adata.obs_names, name="x")
+    y = pd.Series(np.asarray(y_values, dtype=float), index=adata.obs_names, name="y")
+
+    mode = str(mode).lower()
+
+    if mode == "spot":
+        return x.values, y.values, x, y
+
+    if mode != "cluster":
+        raise ValueError("mode must be 'spot' or 'cluster'.")
+
+    labels = _valid_group_series(adata, group_key=group_key)
+
+    df = pd.DataFrame({"x": x, "y": y, "group": labels}).dropna()
+
+    x_out = pd.Series(np.nan, index=adata.obs_names, dtype=float)
+    y_out = pd.Series(np.nan, index=adata.obs_names, dtype=float)
+
+    if not df.empty:
+        group_mean = df.groupby("group", observed=True)[["x", "y"]].mean()
+
+        valid = labels.notna()
+
+        x_out.loc[valid] = labels.loc[valid].map(group_mean["x"]).astype(float)
+        y_out.loc[valid] = labels.loc[valid].map(group_mean["y"]).astype(float)
+
+    return x_out.values, y_out.values, x_out, y_out
+
+
+def plot_bivariate_colocalization(
+    adata,
+    x_values,
+    y_values,
+    x_name="A-to-I",
+    y_name="ADAR",
+    q=0.5,
+    mode="spot",
+    group_key="ground_truth",
+    show_legend=True,
+    spot_size=18,
+    figsize=(11.2, 4),
+):
+    """
+    Plot:
+        x map
+        y map
+        bivariate high/low co-localization map
+
+    mode:
+        "spot"    : use spot-level values
+        "cluster" : aggregate by group_key, then map group means back to spots
+    """
+    x_plot, y_plot, _, _ = _prepare_bivariate_values(
+        adata,
+        x_values=x_values,
+        y_values=y_values,
+        mode=mode,
+        group_key=group_key,
+    )
+
+    classes = _bivariate_classes(x_plot, y_plot, q=q)
+
+    colors = ["#e8e8e8", "#64acbe", "#c85a5a", "#574249"]
+    cmap_bivar = plt.matplotlib.colors.ListedColormap(colors)
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    sc = _spatial_axes(
+        axes[0],
+        adata,
+        x_plot,
+        f"{x_name}\n({mode})",
+        cmap="magma",
+        spot_size=spot_size,
+    )
     if sc is not None:
         fig.colorbar(sc, ax=axes[0], fraction=0.046, pad=0.02)
-    sc = _spatial_axes(axes[1], adata_ai, score, 'SV-A-to-I score', cmap='magma', spot_size=spot_size)
+
+    sc = _spatial_axes(
+        axes[1],
+        adata,
+        y_plot,
+        f"{y_name}\n({mode})",
+        cmap="YlGnBu",
+        spot_size=spot_size,
+    )
     if sc is not None:
         fig.colorbar(sc, ax=axes[1], fraction=0.046, pad=0.02)
-    scatter_ax = axes[-1]
-    if residual_key in adata_ai.obs:
-        resid = adata_ai.obs[residual_key].astype(float).values
-        sc = _spatial_axes(axes[2], adata_ai, resid, 'Residual after deconv + ADAR', cmap='coolwarm', spot_size=spot_size, center=0)
-        if sc is not None:
-            fig.colorbar(sc, ax=axes[2], fraction=0.046, pad=0.02)
-    mask = np.isfinite(expr) & np.isfinite(score)
-    rho, pval = spearmanr(expr[mask], score[mask]) if mask.sum() > 2 else (np.nan, np.nan)
-    sns.regplot(x=expr[mask], y=score[mask], scatter_kws={'s': 14, 'alpha': 0.45, 'linewidth': 0}, line_kws={'color': 'black'}, lowess=True, ax=scatter_ax)
-    scatter_ax.set_xlabel(f'{gene} expression')
-    scatter_ax.set_ylabel('SV-A-to-I score')
-    scatter_ax.set_title(f'{gene} vs A-to-I\\nrho={rho:.2f}, p={pval:.1e}')
+
+    _spatial_axes(
+        axes[2],
+        adata,
+        classes,
+        f"Bivariate\n{x_name} x {y_name}",
+        cmap=cmap_bivar,
+        spot_size=spot_size,
+        clip=(0, 100),
+    )
+
+    if show_legend:
+        handles = [
+            Patch(facecolor=colors[0], edgecolor="none", label=f"low {x_name} / low {y_name}"),
+            Patch(facecolor=colors[1], edgecolor="none", label=f"high {x_name} only"),
+            Patch(facecolor=colors[2], edgecolor="none", label=f"high {y_name} only"),
+            Patch(facecolor=colors[3], edgecolor="none", label=f"high {x_name} / high {y_name}"),
+        ]
+
+        axes[2].legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.12),
+            fontsize=7,
+            frameon=False,
+            ncol=1,
+        )
+
     plt.tight_layout()
-    return (fig, axes)
 
-def plot_adar_adjusted_residual_comparison(adata_ai, residual_before='sv_atoi_residual', residual_after='sv_atoi_residual_deconv_adar', group_key='ground_truth', spot_size=18, figsize=(12, 4)):
-    """Compare residual A-to-I maps before and after ADAR-family adjustment.
+    return fig, axes
 
-Parameters
-----------
-adata_ai : object
-    AnnData object containing A-to-I count layers and spot metadata.
-residual_before : object
-    Column containing residuals before adjustment.
-residual_after : object
-    Column containing residuals after adjustment.
-group_key : object
-    Column name containing spatial group, layer, cluster, or domain labels.
-spot_size : object
-    Marker size for spatial plots.
-figsize : object
-    Matplotlib figure size.
 
-Returns
--------
-object
-    Function-specific result. See the function body and returned variables for details."""
-    if residual_before not in adata_ai.obs or residual_after not in adata_ai.obs:
-        raise ValueError('Both residual columns must be present in adata_ai.obs.')
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    _spatial_axes(axes[0], adata_ai, adata_ai.obs[residual_before].values, 'Residual after deconv', cmap='coolwarm', spot_size=spot_size, center=0)
-    _spatial_axes(axes[1], adata_ai, adata_ai.obs[residual_after].values, 'Residual after deconv + ADAR', cmap='coolwarm', spot_size=spot_size, center=0)
-    df = adata_ai.obs[[residual_before, residual_after]].copy()
-    if group_key in adata_ai.obs:
-        df[group_key] = adata_ai.obs[group_key].astype(str)
-        plot_df = df.melt(id_vars=group_key, value_vars=[residual_before, residual_after], var_name='model', value_name='residual').dropna()
-        sns.boxplot(data=plot_df, x=group_key, y='residual', hue='model', showfliers=False, ax=axes[2])
-        axes[2].tick_params(axis='x', rotation=45)
+# =============================================================================
+# 10. Global A-to-I vs cell types
+# =============================================================================
+
+def analyze_score_vs_celltypes(
+    adata_ai,
+    df_deconv: pd.DataFrame,
+    score_key: str = "global_atoi_score",
+    celltype_cols: Optional[Sequence[str]] = None,
+    covariates=("x_pixel", "y_pixel"),
+    min_complete: int = 30,
+    level: str = "spot",
+    group_key: str = "ground_truth",
+    cluster_agg: str = "mean",
+    store_key: str = "global_atoi_vs_celltypes",
+):
+    """
+    Analyze global A-to-I score versus each deconvolved cell type proportion.
+
+    df_deconv should already be merged/processed in notebook.
+    level:
+        "spot"    : spot-level association
+        "cluster" : aggregate score, covariates and deconvolution by group_key
+    """
+    level = str(level).lower()
+
+    if level not in ["spot", "cluster"]:
+        raise ValueError("level must be 'spot' or 'cluster'.")
+
+    common = adata_ai.obs_names.intersection(df_deconv.index)
+
+    if len(common) == 0:
+        raise ValueError("No common spots between adata_ai and df_deconv.")
+
+    covariates = [c for c in covariates if c in adata_ai.obs.columns]
+
+    if celltype_cols is None:
+        celltype_cols = [
+            c for c in df_deconv.columns
+            if pd.api.types.is_numeric_dtype(df_deconv[c])
+        ]
+
+    celltype_cols = [c for c in celltype_cols if c in df_deconv.columns]
+
+    if level == "cluster":
+        df, _ = _aggregate_analysis_frame_by_group(
+            adata_ai=adata_ai,
+            df_extra=df_deconv,
+            columns=[score_key] + list(covariates) + list(celltype_cols),
+            group_key=group_key,
+            aggfunc=cluster_agg,
+        )
+        unit_col = "n_clusters"
     else:
-        plot_df = df.melt(var_name='model', value_name='residual').dropna()
-        sns.boxplot(data=plot_df, x='model', y='residual', showfliers=False, ax=axes[2])
-        axes[2].tick_params(axis='x', rotation=25)
-    axes[2].axhline(0, color='black', linewidth=1)
-    axes[2].set_title('Residual distribution')
-    axes[2].set_xlabel('')
+        df = (
+            adata_ai.obs.loc[common, [score_key] + covariates]
+            .join(df_deconv.loc[common, celltype_cols], how="left")
+        )
+        unit_col = "n_spots"
+
+    rows = []
+
+    for ct in celltype_cols:
+        cols = [score_key, ct] + covariates
+        sub = df[cols].dropna()
+
+        if sub.shape[0] < min_complete:
+            continue
+
+        if sub[ct].std() == 0 or sub[score_key].std() == 0:
+            continue
+
+        rho, p_spear = spearmanr(sub[ct], sub[score_key])
+
+        X = _zscore_frame(sub[[ct] + covariates])
+
+        y = sub[score_key].astype(float)
+        y = (y - y.mean()) / y.std()
+
+        fit = sm.OLS(y, sm.add_constant(X, has_constant="add")).fit()
+
+        rows.append(
+            {
+                "celltype": ct,
+                "level": level,
+                "group_key": group_key if level == "cluster" else np.nan,
+                unit_col: int(sub.shape[0]),
+                "spearman_rho": float(rho),
+                "spearman_p": float(p_spear),
+                "adjusted_beta": float(fit.params[ct]),
+                "adjusted_p": float(fit.pvalues[ct]),
+                "adjusted_r2": float(fit.rsquared),
+            }
+        )
+
+    res = pd.DataFrame(rows)
+
+    if not res.empty:
+        if "n_spots" not in res.columns:
+            res["n_spots"] = np.nan
+        if "n_clusters" not in res.columns:
+            res["n_clusters"] = np.nan
+        res["spearman_fdr"] = _safe_multipletest(res["spearman_p"])
+        res["adjusted_fdr"] = _safe_multipletest(res["adjusted_p"])
+        res = res.sort_values(["adjusted_fdr", "spearman_fdr"]).reset_index(drop=True)
+
+    adata_ai.uns[store_key] = res
+
+    return res
+
+
+def build_cluster_feature_matrix(
+    adata_ai,
+    df_deconv: Optional[pd.DataFrame] = None,
+    feature_cols: Sequence[str] = (),
+    group_key: str = "ground_truth",
+    aggfunc: str = "mean",
+):
+    """
+    Build a cluster-level feature matrix for descriptive heatmaps.
+
+    feature_cols can include columns from adata_ai.obs and df_deconv.
+    """
+    feature_cols = list(dict.fromkeys(feature_cols))
+
+    mat, _ = _aggregate_analysis_frame_by_group(
+        adata_ai=adata_ai,
+        df_extra=df_deconv,
+        columns=feature_cols,
+        group_key=group_key,
+        aggfunc=aggfunc,
+    )
+
+    mat = mat[[c for c in feature_cols if c in mat.columns]]
+
+    return mat
+
+
+def plot_cluster_feature_heatmap(
+    cluster_matrix: pd.DataFrame,
+    zscore_columns: bool = True,
+    figsize=(8.5, 4.4),
+    cmap="vlag",
+    center=0,
+    title="Cluster-level feature concordance",
+):
+    """
+    Plot a cluster x feature heatmap, optionally z-scoring each feature.
+    """
+    if cluster_matrix.empty:
+        raise ValueError("cluster_matrix is empty.")
+
+    plot_df = cluster_matrix.astype(float).copy()
+
+    if zscore_columns:
+        plot_df = _zscore_frame(plot_df)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sns.heatmap(
+        plot_df,
+        cmap=cmap,
+        center=center,
+        annot=True,
+        fmt=".2f",
+        linewidths=0.4,
+        linecolor="white",
+        cbar_kws={"label": "column z-score" if zscore_columns else "value"},
+        ax=ax,
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.tick_params(axis="x", rotation=45)
+    ax.tick_params(axis="y", rotation=0)
+
     plt.tight_layout()
-    return (fig, axes)
+
+    return fig, ax, plot_df
+
+
+def plot_cluster_score_comparison(
+    adata,
+    score_keys=("global_atoi_score", "sv_atoi_score"),
+    titles=("Global A-to-I", "SV-A-to-I"),
+    group_key="ground_truth",
+    spot_size=18,
+    cmap="magma",
+    figsize=(11.5, 6.8),
+):
+    """
+    Compare two cluster-level A-to-I scores with maps and group means.
+    """
+    score_keys = list(score_keys)
+    titles = list(titles)
+
+    missing = [k for k in score_keys if k not in adata.obs.columns]
+
+    if missing:
+        raise ValueError(f"Missing score columns: {missing}")
+
+    labels = _valid_group_series(adata, group_key=group_key)
+
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, len(score_keys), height_ratios=[1.0, 0.85])
+    map_axes = [fig.add_subplot(gs[0, i]) for i in range(len(score_keys))]
+    bar_ax = fig.add_subplot(gs[1, :])
+
+    rows = []
+
+    for ax, key, title in zip(map_axes, score_keys, titles):
+        values = adata.obs[key].astype(float)
+        cluster_values = _map_group_mean_to_spots(values, labels)
+
+        sc = _spatial_axes(
+            ax,
+            adata,
+            cluster_values,
+            f"Cluster-level {title}",
+            cmap=cmap,
+            spot_size=spot_size,
+        )
+
+        if sc is not None:
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+
+        df = pd.DataFrame({"group": labels, "value": values}).dropna()
+
+        if not df.empty:
+            group_mean = df.groupby("group", observed=True)["value"].mean()
+
+            for group, value in group_mean.items():
+                rows.append(
+                    {
+                        "group": group,
+                        "score": title,
+                        "score_key": key,
+                        "value": float(value),
+                    }
+                )
+
+    summary = pd.DataFrame(rows)
+
+    if summary.empty:
+        raise ValueError("No group-level score values were available.")
+
+    first_title = titles[0]
+    order = (
+        summary[summary["score"] == first_title]
+        .sort_values("value")["group"]
+        .tolist()
+    )
+
+    sns.barplot(
+        data=summary,
+        x="group",
+        y="value",
+        hue="score",
+        order=order,
+        hue_order=titles,
+        ax=bar_ax,
+    )
+
+    bar_ax.axhline(0, color="black", linewidth=1)
+    bar_ax.set_xlabel("")
+    bar_ax.set_ylabel("cluster mean score")
+    bar_ax.set_title("Global vs SV-A-to-I cluster-level score comparison")
+    bar_ax.tick_params(axis="x", rotation=45)
+    bar_ax.legend(frameon=False)
+
+    wide = summary.pivot(index="group", columns="score", values="value")
+
+    if len(titles) == 2 and set(titles).issubset(wide.columns):
+        sub = wide[titles].dropna()
+
+        if sub.shape[0] >= 3:
+            rho, pval = spearmanr(sub[titles[0]], sub[titles[1]])
+            bar_ax.text(
+                0.99,
+                0.96,
+                f"cluster rho={rho:.2f}, p={pval:.2g}",
+                transform=bar_ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=9,
+            )
+
+    plt.tight_layout()
+
+    return fig, {"maps": map_axes, "bar": bar_ax}, summary
+
+
+def plot_association_dotplot(
+    assoc_df: pd.DataFrame,
+    label_col: str,
+    beta_col: str = "adjusted_beta",
+    fdr_col: str = "adjusted_fdr",
+    rho_col: str = "spearman_rho",
+    p_col: str = "spearman_p",
+    sort_col: Optional[str] = None,
+    top_n: Optional[int] = None,
+    show_fdr: bool = False,
+    title: str = "Descriptive association with global A-to-I score",
+    figsize=(7, 4),
+):
+    df = assoc_df.copy()
+
+    if df.empty:
+        raise ValueError("assoc_df is empty.")
+
+    if sort_col is None:
+        sort_col = rho_col if rho_col in df.columns else beta_col
+
+    if sort_col not in df.columns:
+        raise ValueError(f"{sort_col!r} not found in assoc_df.")
+
+    df = df.sort_values(sort_col)
+
+    if top_n is not None and df.shape[0] > top_n:
+        lower = df.head(top_n // 2)
+        upper = df.tail(top_n - lower.shape[0])
+        df = pd.concat([lower, upper], axis=0)
+
+    y = np.arange(df.shape[0])
+
+    if p_col in df.columns:
+        sig = -np.log10(df[p_col].clip(lower=1e-300))
+    elif fdr_col in df.columns:
+        sig = -np.log10(df[fdr_col].clip(lower=1e-300))
+    else:
+        sig = pd.Series(1.0, index=df.index)
+
+    sizes = np.clip(30 + sig * 25, 40, 260)
+    color_values = df[rho_col] if rho_col in df.columns else df[beta_col]
+    colors = np.where(color_values >= 0, "#d95f02", "#1b9e77")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.hlines(y, 0, df[sort_col], color="#bdbdbd", linewidth=1.5)
+    ax.scatter(
+        df[sort_col],
+        y,
+        s=sizes,
+        c=colors,
+        edgecolor="white",
+        linewidth=0.8,
+        zorder=3,
+    )
+
+    ax.axvline(0, color="black", linewidth=1)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(df[label_col].astype(str))
+    ax.set_xlabel(sort_col.replace("_", " "))
+    ax.set_title(title)
+
+    for yi, (_, row) in enumerate(df.iterrows()):
+        if show_fdr and fdr_col in row:
+            label = f"FDR={row[fdr_col]:.1e}"
+        elif p_col in row:
+            label = f"p={row[p_col]:.2g}"
+        else:
+            label = ""
+
+        if label:
+            ax.text(
+                row[sort_col],
+                yi + 0.18,
+                label,
+                fontsize=7,
+                ha="center",
+            )
+
+    plt.tight_layout()
+
+    return fig, ax
+
+
+def plot_model_r2_comparison(
+    summaries,
+    labels=("Cell type", "Cell type + ADAR"),
+    r2_key="r2",
+    adj_r2_key="adj_r2",
+    title="Cluster-level model fit",
+    figsize=(5.2, 3.8),
+):
+    """
+    Plot R2 and adjusted R2 for model summary dictionaries.
+    """
+    rows = []
+
+    for label, summary in zip(labels, summaries):
+        rows.append({"model": label, "metric": "R2", "value": summary.get(r2_key, np.nan)})
+        rows.append({"model": label, "metric": "adjusted R2", "value": summary.get(adj_r2_key, np.nan)})
+
+    df = pd.DataFrame(rows)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sns.barplot(
+        data=df,
+        x="model",
+        y="value",
+        hue="metric",
+        palette=["#4c78a8", "#f58518"],
+        ax=ax,
+    )
+
+    ax.set_ylim(0, max(1.0, np.nanmax(df["value"]) * 1.08))
+    ax.set_ylabel("variance explained")
+    ax.set_xlabel("")
+    ax.set_title(title)
+    ax.legend(frameon=False, loc="upper left")
+
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.2f", fontsize=8, padding=2)
+
+    plt.tight_layout()
+
+    return fig, ax, df
+
+
+# =============================================================================
+# 11. Adjustment and joint model
+# =============================================================================
+
+def fit_adjustment_model(
+    adata_ai,
+    score_key,
+    predictors,
+    df_extra=None,
+    covariates=(),
+    residual_key="global_atoi_residual",
+    min_complete=30,
+    drop_reference=None,
+    standardize=True,
+    level: str = "spot",
+    group_key: str = "ground_truth",
+    cluster_agg: str = "mean",
+    store_key="adjustment_model",
+):
+    """
+    Fit OLS:
+        score ~ predictors + covariates
+
+    Adds residual to adata_ai.obs[residual_key].
+
+    level:
+        "spot"    : fit on individual spots
+        "cluster" : fit on group-level means/medians and map residuals to spots
+
+    drop_reference:
+        Optional predictor to remove, useful for compositional cell-type proportions.
+        Example: drop_reference="Mix"
+    """
+    level = str(level).lower()
+
+    if level not in ["spot", "cluster"]:
+        raise ValueError("level must be 'spot' or 'cluster'.")
+
+    if level == "cluster":
+        all_cols = [score_key] + list(predictors) + list(covariates)
+        df, labels = _aggregate_analysis_frame_by_group(
+            adata_ai=adata_ai,
+            df_extra=df_extra,
+            columns=all_cols,
+            group_key=group_key,
+            aggfunc=cluster_agg,
+        )
+    else:
+        labels = None
+        common = adata_ai.obs_names
+
+        if df_extra is not None:
+            common = common.intersection(df_extra.index)
+
+        df = adata_ai.obs.loc[common, [score_key]].copy()
+
+        obs_predictors = [c for c in predictors if c in adata_ai.obs.columns]
+        obs_covariates = [c for c in covariates if c in adata_ai.obs.columns]
+
+        if obs_predictors:
+            df = df.join(adata_ai.obs.loc[common, obs_predictors], how="left")
+
+        if obs_covariates:
+            df = df.join(adata_ai.obs.loc[common, obs_covariates], how="left")
+
+        if df_extra is not None:
+            extra_cols = [
+                c for c in list(predictors) + list(covariates)
+                if c in df_extra.columns and c not in df.columns
+            ]
+
+            if extra_cols:
+                df = df.join(df_extra.loc[common, extra_cols], how="left")
+
+    model_cols = [
+        c for c in list(predictors) + list(covariates)
+        if c in df.columns
+    ]
+
+    if drop_reference is not None and drop_reference in model_cols:
+        model_cols = [c for c in model_cols if c != drop_reference]
+
+    keep_cols = []
+    dropped_zero_var = []
+
+    for c in model_cols:
+        x = pd.to_numeric(df[c], errors="coerce")
+
+        if x.dropna().shape[0] > 0 and x.std(skipna=True) > 1e-10:
+            keep_cols.append(c)
+        else:
+            dropped_zero_var.append(c)
+
+    model_cols = keep_cols
+
+    sub = (
+        df[[score_key] + model_cols]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .copy()
+    )
+
+    min_model_units = len(model_cols) + (2 if level == "cluster" else 5)
+
+    if sub.shape[0] < max(min_complete, min_model_units):
+        unit_name = "clusters" if level == "cluster" else "spots"
+        raise ValueError(
+            f"Not enough complete {unit_name} for adjustment model: "
+            f"n={sub.shape[0]}, predictors={len(model_cols)}"
+        )
+
+    if sub[score_key].std() == 0:
+        raise ValueError(f"{score_key} has zero variance.")
+
+    X = sub[model_cols].astype(float).copy()
+
+    if standardize:
+        X = _zscore_frame(X)
+
+    y = sub[score_key].astype(float)
+
+    fit = sm.OLS(y, sm.add_constant(X, has_constant="add")).fit()
+
+    if level == "cluster":
+        cluster_residual = pd.Series(fit.resid, index=sub.index, name=f"{residual_key}_cluster")
+        residual = pd.Series(np.nan, index=adata_ai.obs_names, name=residual_key)
+        valid = labels.notna() & labels.isin(cluster_residual.index)
+        residual.loc[valid] = labels.loc[valid].map(cluster_residual).astype(float)
+        adata_ai.uns[f"{store_key}_cluster_residual"] = cluster_residual
+    else:
+        residual = pd.Series(np.nan, index=adata_ai.obs_names, name=residual_key)
+        residual.loc[sub.index] = fit.resid
+
+    adata_ai.obs[residual_key] = residual
+
+    params = fit.params.to_frame("coef").join(fit.pvalues.to_frame("pval"))
+    params["term"] = params.index
+    params = params.reset_index(drop=True)
+    params["padj"] = _safe_multipletest(params["pval"])
+
+    try:
+        condition_number = float(
+            np.linalg.cond(sm.add_constant(X, has_constant="add").values)
+        )
+    except Exception:
+        condition_number = np.nan
+
+    summary = {
+        "level": level,
+        "group_key": group_key if level == "cluster" else np.nan,
+        "cluster_agg": cluster_agg if level == "cluster" else np.nan,
+        "n_spots": int(sub.shape[0]) if level == "spot" else np.nan,
+        "n_clusters": int(sub.shape[0]) if level == "cluster" else np.nan,
+        "r2": float(fit.rsquared),
+        "adj_r2": float(fit.rsquared_adj),
+        "residual_key": residual_key,
+        "predictors": model_cols,
+        "drop_reference": drop_reference,
+        "dropped_zero_var": dropped_zero_var,
+        "condition_number": condition_number,
+    }
+
+    adata_ai.uns[store_key] = summary
+    adata_ai.uns[f"{store_key}_params"] = params
+
+    return residual, fit, params, summary
+
+
+def fit_joint_atoi_model(
+    adata_ai,
+    df_deconv,
+    score_key="global_atoi_score",
+    celltype_cols=None,
+    adar_cols=("expr_ADAR", "expr_ADARB1", "expr_ADARB2"),
+    covariates=("x_pixel", "y_pixel"),
+    residual_key="global_atoi_residual_celltype_adar",
+    drop_reference="Mix",
+    min_complete=30,
+    level: str = "spot",
+    group_key: str = "ground_truth",
+    cluster_agg: str = "mean",
+    store_key="joint_global_atoi_model",
+):
+    """
+    Joint model:
+        global_atoi_score ~ cell types + ADAR-family + spatial covariates
+    """
+    if celltype_cols is None:
+        celltype_cols = [
+            c for c in df_deconv.columns
+            if pd.api.types.is_numeric_dtype(df_deconv[c])
+        ]
+
+    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
+
+    predictors = list(celltype_cols) + list(adar_cols)
+
+    return fit_adjustment_model(
+        adata_ai=adata_ai,
+        score_key=score_key,
+        predictors=predictors,
+        df_extra=df_deconv,
+        covariates=covariates,
+        residual_key=residual_key,
+        min_complete=min_complete,
+        drop_reference=drop_reference,
+        level=level,
+        group_key=group_key,
+        cluster_agg=cluster_agg,
+        store_key=store_key,
+    )
+
+
+# =============================================================================
+# 12. Residual visualization
+# =============================================================================
+
+def plot_residual_progression(
+    adata_ai,
+    keys=(
+        "global_atoi_score",
+        "global_atoi_residual_celltype",
+        "global_atoi_residual_celltype_adar",
+    ),
+    titles=(
+        "Original global A-to-I",
+        "Residual after cell types",
+        "Residual after cell types + ADAR",
+    ),
+    group_key="ground_truth",
+    spot_size=18,
+    kind="bar",
+    figsize=(13, 7.2),
+):
+    """
+    Show cluster-level progression:
+        original global A-to-I
+        cell-type-adjusted residual
+        cell-type + ADAR-adjusted residual
+
+    Top row: cluster-level spatial maps.
+    Bottom row: cluster means and between-cluster range.
+    """
+    kind = str(kind).lower()
+
+    if kind not in ["bar", "line"]:
+        raise ValueError("kind must be 'bar' or 'line'.")
+
+    labels = _valid_group_series(adata_ai, group_key=group_key)
+    rows = []
+
+    for i, (key, title) in enumerate(zip(keys, titles)):
+        if key not in adata_ai.obs.columns:
+            continue
+
+        values = adata_ai.obs[key].astype(float)
+        plot_df = pd.DataFrame(
+            {
+                "group": labels,
+                "value": values,
+            }
+        ).dropna()
+
+        if not plot_df.empty:
+            group_mean = plot_df.groupby("group", observed=True)["value"].mean()
+
+            for group, value in group_mean.items():
+                rows.append(
+                    {
+                        "group": group,
+                        "metric": title,
+                        "key": key,
+                        "value": float(value),
+                    }
+                )
+
+    summary = pd.DataFrame(rows)
+
+    if summary.empty:
+        raise ValueError("No residual progression values were available.")
+
+    metric_order = [title for key, title in zip(keys, titles) if key in adata_ai.obs.columns]
+
+    if metric_order and (summary["metric"] == metric_order[0]).any():
+        order = (
+            summary[summary["metric"] == metric_order[0]]
+            .sort_values("value")["group"]
+            .tolist()
+        )
+    else:
+        order = (
+            summary.groupby("group", observed=True)["value"]
+            .mean()
+            .sort_values()
+            .index
+            .tolist()
+        )
+
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(
+        2,
+        3,
+        height_ratios=[1.0, 0.82],
+        width_ratios=[1.0, 1.0, 1.0],
+    )
+
+    map_axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
+    trend_ax = fig.add_subplot(gs[1, :2])
+    range_ax = fig.add_subplot(gs[1, 2])
+
+    for i, (key, title) in enumerate(zip(keys, titles)):
+        if i >= len(map_axes):
+            break
+
+        ax = map_axes[i]
+
+        if key not in adata_ai.obs.columns:
+            ax.axis("off")
+            continue
+
+        values = adata_ai.obs[key].astype(float)
+        cluster_values = _map_group_mean_to_spots(values, labels)
+
+        center = 0 if "residual" in key else None
+        cmap = "coolwarm" if "residual" in key else "magma"
+
+        sc = _spatial_axes(
+            ax,
+            adata_ai,
+            cluster_values,
+            title,
+            cmap=cmap,
+            spot_size=spot_size,
+            center=center,
+        )
+
+        if sc is not None:
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+
+    if kind == "bar":
+        sns.barplot(
+            data=summary,
+            x="group",
+            y="value",
+            hue="metric",
+            order=order,
+            hue_order=metric_order,
+            ax=trend_ax,
+        )
+    else:
+        wide = summary.pivot(index="group", columns="metric", values="value").reindex(order)
+        wide.loc[:, metric_order].plot(marker="o", linewidth=1.8, ax=trend_ax)
+
+    trend_ax.axhline(0, color="black", linewidth=1)
+    trend_ax.set_xlabel("")
+    trend_ax.set_ylabel("cluster mean value")
+    trend_ax.set_title("Cluster-level A-to-I residual progression")
+    trend_ax.tick_params(axis="x", rotation=45)
+    trend_ax.legend(frameon=False, fontsize=8)
+
+    range_df = (
+        summary.groupby("metric", observed=True)["value"]
+        .agg(lambda x: float(np.nanmax(x) - np.nanmin(x)))
+        .reindex(metric_order)
+        .reset_index(name="cluster_range")
+    )
+
+    sns.barplot(
+        data=range_df,
+        y="metric",
+        x="cluster_range",
+        color="#8da0cb",
+        edgecolor="black",
+        linewidth=0.5,
+        ax=range_ax,
+    )
+    range_ax.set_xlabel("max - min")
+    range_ax.set_ylabel("")
+    range_ax.set_title("Between-cluster range")
+
+    plt.tight_layout()
+
+    axes = {
+        "maps": map_axes,
+        "trend": trend_ax,
+        "range": range_ax,
+    }
+
+    return fig, axes, summary
+
+
+# =============================================================================
+# 13. Site-level ADAR correlation
+# =============================================================================
+
+def run_site_adar_correlation(
+    adata_ai,
+    candidate_sites=None,
+    adar_cols=("expr_ADAR", "expr_ADARB1", "expr_ADARB2"),
+    group_key="ground_truth",
+    min_cov=10,
+    min_valid_spots=30,
+    min_cluster_groups=3,
+    a_layer="A",
+    g_layer="G",
+    store_key="site_adar_correlation",
+    verbose=True,
+):
+    """
+    Site-level ADAR association by correlation.
+
+    For each site and each ADAR:
+        1. spot-level Spearman correlation
+        2. cluster-level Spearman correlation using group-level mean editing and expression
+    """
+    adar_cols = [c for c in adar_cols if c in adata_ai.obs.columns]
+
+    if len(adar_cols) == 0:
+        raise ValueError("No ADAR columns found in adata_ai.obs.")
+
+    if isinstance(candidate_sites, pd.DataFrame):
+        df_sites = candidate_sites.copy()
+
+        if "is_sv_atoi" in df_sites.columns and df_sites["is_sv_atoi"].any():
+            df_sites = df_sites[df_sites["is_sv_atoi"] == True].copy()
+
+        sites = [s for s in df_sites["site"].astype(str) if s in adata_ai.var_names]
+
+    elif candidate_sites is None:
+        sites = list(adata_ai.var_names)
+
+    else:
+        sites = [str(s) for s in candidate_sites if str(s) in adata_ai.var_names]
+
+    labels = None
+
+    if group_key is not None and group_key in adata_ai.obs.columns:
+        labels = _valid_group_series(adata_ai, group_key=group_key)
+
+    rows = []
+
+    for i, site in enumerate(sites):
+        ratio = get_site_editing_ratio(
+            adata_ai,
+            site=site,
+            min_cov=min_cov,
+            a_layer=a_layer,
+            g_layer=g_layer,
+        )
+
+        if "Gene.refGene" in adata_ai.var.columns:
+            gene = adata_ai.var.loc[site].get("Gene.refGene", site)
+        else:
+            gene = site
+
+        for adar_col in adar_cols:
+            expr = adata_ai.obs[adar_col].astype(float)
+
+            spot_df = pd.DataFrame(
+                {
+                    "ratio": ratio,
+                    "expr": expr,
+                },
+                index=adata_ai.obs_names,
+            ).dropna()
+
+            if (
+                spot_df.shape[0] >= min_valid_spots
+                and spot_df["ratio"].std() > 0
+                and spot_df["expr"].std() > 0
+            ):
+                rho, pval = spearmanr(spot_df["expr"], spot_df["ratio"])
+            else:
+                rho, pval = np.nan, np.nan
+
+            rows.append(
+                {
+                    "site": site,
+                    "gene": gene,
+                    "adar": adar_col.replace("expr_", ""),
+                    "adar_col": adar_col,
+                    "level": "spot",
+                    "n": int(spot_df.shape[0]),
+                    "spearman_rho": rho,
+                    "spearman_p": pval,
+                    "mean_ratio": float(spot_df["ratio"].mean()) if not spot_df.empty else np.nan,
+                    "sd_ratio": float(spot_df["ratio"].std()) if not spot_df.empty else np.nan,
+                }
+            )
+
+            if labels is not None:
+                cl_df = pd.DataFrame(
+                    {
+                        "ratio": ratio,
+                        "expr": expr,
+                        "group": labels,
+                    },
+                    index=adata_ai.obs_names,
+                ).dropna()
+
+                if not cl_df.empty:
+                    cl_mean = cl_df.groupby("group", observed=True)[["ratio", "expr"]].mean()
+                else:
+                    cl_mean = pd.DataFrame(columns=["ratio", "expr"])
+
+                if (
+                    cl_mean.shape[0] >= min_cluster_groups
+                    and cl_mean["ratio"].std() > 0
+                    and cl_mean["expr"].std() > 0
+                ):
+                    rho_c, pval_c = spearmanr(cl_mean["expr"], cl_mean["ratio"])
+                else:
+                    rho_c, pval_c = np.nan, np.nan
+
+                rows.append(
+                    {
+                        "site": site,
+                        "gene": gene,
+                        "adar": adar_col.replace("expr_", ""),
+                        "adar_col": adar_col,
+                        "level": "cluster",
+                        "n": int(cl_mean.shape[0]),
+                        "spearman_rho": rho_c,
+                        "spearman_p": pval_c,
+                        "mean_ratio": float(cl_mean["ratio"].mean()) if not cl_mean.empty else np.nan,
+                        "sd_ratio": float(cl_mean["ratio"].std()) if not cl_mean.empty else np.nan,
+                    }
+                )
+
+        if verbose and (i + 1) % 500 == 0:
+            print(f"Processed {i + 1}/{len(sites)} candidate sites")
+
+    res = pd.DataFrame(rows)
+
+    if not res.empty:
+        res["spearman_fdr"] = np.nan
+
+        for level in res["level"].dropna().unique():
+            for adar in res["adar"].dropna().unique():
+                idx = (res["level"] == level) & (res["adar"] == adar)
+                res.loc[idx, "spearman_fdr"] = _safe_multipletest(res.loc[idx, "spearman_p"])
+
+        res["abs_rho"] = res["spearman_rho"].abs()
+
+        best = (
+            res.sort_values(
+                ["site", "level", "spearman_fdr", "abs_rho"],
+                ascending=[True, True, True, False],
+            )
+            .drop_duplicates(["site", "level"])
+            [["site", "level", "adar", "adar_col", "spearman_rho", "spearman_fdr"]]
+            .rename(
+                columns={
+                    "adar": "best_adar",
+                    "adar_col": "best_adar_col",
+                    "spearman_rho": "best_adar_rho",
+                    "spearman_fdr": "best_adar_fdr",
+                }
+            )
+        )
+
+        res = res.merge(best, on=["site", "level"], how="left")
+
+        res = res.sort_values(
+            ["level", "spearman_fdr", "abs_rho"],
+            ascending=[True, True, False],
+        ).reset_index(drop=True)
+
+    adata_ai.uns[store_key] = res
+
+    return res
+
+
+# =============================================================================
+# 14. Top site-ADAR co-localization examples
+# =============================================================================
+
+def plot_top_site_adar_colocalization(
+    adata_ai,
+    site_adar_assoc,
+    n_examples=6,
+    min_cov=10,
+    q=0.5,
+    level="cluster",
+    mode=None,
+    group_key="ground_truth",
+    spot_size=16,
+    figsize=None,
+):
+    """
+    Plot top site-ADAR examples:
+        site editing ratio map
+        ADAR expression map
+        bivariate map
+        scatter
+    """
+    if site_adar_assoc.empty:
+        raise ValueError("site_adar_assoc is empty.")
+
+    if mode is None:
+        mode = level
+
+    df = site_adar_assoc.copy()
+
+    if "level" in df.columns:
+        df = df[df["level"] == level].copy()
+
+    if df.empty:
+        raise ValueError(f"No site-ADAR rows for level={level!r}.")
+
+    if "spearman_fdr" in df.columns:
+        fdr_col = "spearman_fdr"
+    elif "padj" in df.columns:
+        fdr_col = "padj"
+    else:
+        fdr_col = None
+
+    if "abs_rho" not in df.columns and "spearman_rho" in df.columns:
+        df["abs_rho"] = df["spearman_rho"].abs()
+
+    sort_cols = []
+    ascending = []
+
+    if fdr_col is not None:
+        sort_cols.append(fdr_col)
+        ascending.append(True)
+
+    if "abs_rho" in df.columns:
+        sort_cols.append("abs_rho")
+        ascending.append(False)
+
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=ascending)
+
+    pairs = df.drop_duplicates(["site", "adar_col"]).head(n_examples)
+
+    if figsize is None:
+        figsize = (15, 3.8 * len(pairs))
+
+    fig, axes = plt.subplots(len(pairs), 4, figsize=figsize)
+    axes = np.atleast_2d(axes)
+
+    for r, (_, row) in enumerate(pairs.iterrows()):
+        site = row["site"]
+        adar_col = row["adar_col"]
+        adar_name = row.get("adar", adar_col.replace("expr_", ""))
+
+        ratio = get_site_editing_ratio(adata_ai, site=site, min_cov=min_cov)
+        expr = adata_ai.obs[adar_col].astype(float)
+
+        ratio_plot, expr_plot, _, _ = _prepare_bivariate_values(
+            adata_ai,
+            x_values=ratio.values,
+            y_values=expr.values,
+            mode=mode,
+            group_key=group_key,
+        )
+
+        classes = _bivariate_classes(ratio_plot, expr_plot, q=q)
+
+        colors = ["#e8e8e8", "#64acbe", "#c85a5a", "#574249"]
+        cmap_bivar = plt.matplotlib.colors.ListedColormap(colors)
+
+        if site in adata_ai.var.index and "Gene.refGene" in adata_ai.var.columns:
+            site_gene = adata_ai.var.loc[site].get("Gene.refGene", site)
+        else:
+            site_gene = site
+
+        sc = _spatial_axes(
+            axes[r, 0],
+            adata_ai,
+            ratio_plot,
+            f"{site_gene} editing\n{site}",
+            cmap="magma",
+            spot_size=spot_size,
+        )
+        if sc is not None:
+            fig.colorbar(sc, ax=axes[r, 0], fraction=0.046, pad=0.02)
+
+        sc = _spatial_axes(
+            axes[r, 1],
+            adata_ai,
+            expr_plot,
+            f"{adar_name} expression",
+            cmap="YlGnBu",
+            spot_size=spot_size,
+        )
+        if sc is not None:
+            fig.colorbar(sc, ax=axes[r, 1], fraction=0.046, pad=0.02)
+
+        _spatial_axes(
+            axes[r, 2],
+            adata_ai,
+            classes,
+            f"Bivariate map\n{mode}",
+            cmap=cmap_bivar,
+            spot_size=spot_size,
+            clip=(0, 100),
+        )
+
+        handles = [
+            Patch(facecolor=colors[0], edgecolor="none", label="low editing / low ADAR"),
+            Patch(facecolor=colors[1], edgecolor="none", label="high editing only"),
+            Patch(facecolor=colors[2], edgecolor="none", label="high ADAR only"),
+            Patch(facecolor=colors[3], edgecolor="none", label="high editing / high ADAR"),
+        ]
+
+        axes[r, 2].legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.12),
+            fontsize=7,
+            frameon=False,
+        )
+
+        mask = np.isfinite(ratio_plot) & np.isfinite(expr_plot)
+
+        if mask.sum() > 2:
+            rho, pval = spearmanr(expr_plot[mask], ratio_plot[mask])
+        else:
+            rho, pval = np.nan, np.nan
+
+        sns.regplot(
+            x=expr_plot[mask],
+            y=ratio_plot[mask],
+            scatter_kws={"s": 14, "alpha": 0.45, "linewidth": 0},
+            line_kws={"color": "black"},
+            lowess=True,
+            ax=axes[r, 3],
+        )
+
+        axes[r, 3].set_xlabel(f"{adar_name} expression")
+        axes[r, 3].set_ylabel("site editing ratio")
+
+        if fdr_col is not None:
+            axes[r, 3].set_title(f"{mode} rho={rho:.2f}, FDR={row[fdr_col]:.1e}")
+        else:
+            axes[r, 3].set_title(f"{mode} rho={rho:.2f}, p={pval:.1e}")
+
+    plt.tight_layout()
+
+    return fig, axes
