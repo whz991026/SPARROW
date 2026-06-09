@@ -211,6 +211,149 @@ def _zscore_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def add_obs_zmean_score(
+    adata,
+    cols: Sequence[str],
+    score_name: str,
+    min_nonmissing: int = 1,
+):
+    """
+    Add a row-wise mean of z-scored obs columns.
+
+    Useful for compact modules such as ADAR-family expression when the
+    cluster-level model has too few groups for many separate predictors.
+    """
+    cols = [c for c in cols if c in adata.obs.columns]
+
+    if not cols:
+        raise ValueError("No requested obs columns were found.")
+
+    df = adata.obs[cols].apply(pd.to_numeric, errors="coerce")
+    z = _zscore_frame(df)
+
+    score = z.mean(axis=1, skipna=True)
+    valid_n = df.notna().sum(axis=1)
+    score[valid_n < min_nonmissing] = np.nan
+
+    adata.obs[score_name] = score.astype(float)
+    adata.uns[f"{score_name}_columns"] = cols
+
+    return pd.Series(score, index=adata.obs_names, name=score_name)
+
+
+def add_deconvolution_modules(
+    df_deconv: pd.DataFrame,
+    modules: Optional[dict] = None,
+):
+    """
+    Add compact deconvolution modules by summing existing cell-type columns.
+
+    Default module:
+        Glial_like = Oligos + Astros + Micro/Macro + OPCs
+    """
+    if modules is None:
+        modules = {
+            "Glial_like": ("Oligos", "Astros", "Micro/Macro", "OPCs"),
+        }
+
+    out = df_deconv.copy()
+    module_cols = []
+    module_members = {}
+
+    for module_name, members in modules.items():
+        present = [c for c in members if c in out.columns]
+
+        if present:
+            out[module_name] = out[present].sum(axis=1)
+            module_cols.append(module_name)
+            module_members[module_name] = present
+
+    return out, module_cols, module_members
+
+
+def add_cluster_deconvolution_pcs(
+    adata_ai,
+    df_deconv: pd.DataFrame,
+    celltype_cols: Sequence[str],
+    group_key: str = "ground_truth",
+    n_components: int = 1,
+    prefix: str = "CellType_PC",
+    aggfunc: str = "mean",
+):
+    """
+    Compress all deconvolved cell-type proportions into cluster-level PCs.
+
+    PCs are fit on the cluster x cell-type matrix and then mapped back to spots
+    through group labels, so the resulting columns can be used by the existing
+    cluster-level model helpers.
+    """
+    celltype_cols = [c for c in celltype_cols if c in df_deconv.columns]
+
+    if not celltype_cols:
+        raise ValueError("No cell-type columns were found in df_deconv.")
+
+    cluster_mat, labels = _aggregate_analysis_frame_by_group(
+        adata_ai=adata_ai,
+        df_extra=df_deconv,
+        columns=celltype_cols,
+        group_key=group_key,
+        aggfunc=aggfunc,
+    )
+
+    cluster_mat = cluster_mat.dropna(axis=0, how="all").copy()
+
+    if cluster_mat.shape[0] < 2:
+        raise ValueError("Need at least two clusters to compute cell-type PCs.")
+
+    X = cluster_mat.astype(float).copy()
+    X = X.fillna(X.mean(axis=0))
+    X = _zscore_frame(X)
+
+    max_components = min(int(n_components), X.shape[0] - 1, X.shape[1])
+
+    if max_components < 1:
+        raise ValueError("No valid cell-type PC components can be computed.")
+
+    U, S, Vt = np.linalg.svd(X.values, full_matrices=False)
+
+    pc_cols = [f"{prefix}{i + 1}" for i in range(max_components)]
+    scores = pd.DataFrame(
+        U[:, :max_components] * S[:max_components],
+        index=cluster_mat.index,
+        columns=pc_cols,
+    )
+
+    loadings = pd.DataFrame(
+        Vt[:max_components, :].T,
+        index=cluster_mat.columns,
+        columns=pc_cols,
+    )
+
+    explained = (S ** 2) / np.sum(S ** 2)
+    explained = pd.Series(
+        explained[:max_components],
+        index=pc_cols,
+        name="explained_variance_ratio",
+    )
+
+    out = df_deconv.copy()
+
+    for pc in pc_cols:
+        out[pc] = np.nan
+
+    valid = labels.notna() & labels.isin(scores.index)
+
+    if valid.any():
+        out.loc[valid, pc_cols] = scores.reindex(labels.loc[valid].values).values
+
+    adata_ai.uns[f"{prefix}_cluster_scores"] = scores
+    adata_ai.uns[f"{prefix}_loadings"] = loadings
+    adata_ai.uns[f"{prefix}_explained_variance_ratio"] = explained
+    adata_ai.uns[f"{prefix}_celltype_cols"] = celltype_cols
+
+    return out, pc_cols, scores, loadings, explained
+
+
 def _safe_multipletest(pvals, method="fdr_bh"):
     p = pd.Series(pvals).astype(float).fillna(1.0)
     p = p.clip(lower=np.nextafter(0, 1), upper=1.0)
@@ -2482,6 +2625,105 @@ def plot_model_r2_comparison(
     plt.tight_layout()
 
     return fig, ax, df
+
+
+def plot_cross_sample_model_summary(
+    model_df: pd.DataFrame,
+    sample_col: str = "sample_id",
+    figsize=(8.5, 4.2),
+):
+    """
+    Plot cross-sample cell-type-only vs joint model fit.
+
+    Required columns:
+        sample_id, celltype_r2, joint_r2
+    Optional:
+        celltype_adj_r2, joint_adj_r2, n_clusters
+    """
+    if model_df.empty:
+        raise ValueError("model_df is empty.")
+
+    df = model_df.copy()
+
+    required = {sample_col, "celltype_r2", "joint_r2"}
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    df["delta_r2"] = df["joint_r2"] - df["celltype_r2"]
+
+    long_rows = []
+
+    for _, row in df.iterrows():
+        long_rows.append(
+            {
+                sample_col: row[sample_col],
+                "model": "Cell type",
+                "R2": row["celltype_r2"],
+            }
+        )
+        long_rows.append(
+            {
+                sample_col: row[sample_col],
+                "model": "Cell type + ADAR",
+                "R2": row["joint_r2"],
+            }
+        )
+
+    long_df = pd.DataFrame(long_rows)
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=figsize,
+        gridspec_kw={"width_ratios": [1.55, 0.85]},
+    )
+
+    sns.barplot(
+        data=long_df,
+        x=sample_col,
+        y="R2",
+        hue="model",
+        palette=["#4c78a8", "#f58518"],
+        ax=axes[0],
+    )
+
+    axes[0].set_ylim(0, max(1.0, np.nanmax(long_df["R2"]) * 1.08))
+    axes[0].set_xlabel("")
+    axes[0].set_ylabel("R2")
+    axes[0].set_title("Cross-sample model fit")
+    axes[0].legend(frameon=False, fontsize=8)
+
+    sns.barplot(
+        data=df,
+        x=sample_col,
+        y="delta_r2",
+        color="#8da0cb",
+        edgecolor="black",
+        linewidth=0.5,
+        ax=axes[1],
+    )
+
+    axes[1].axhline(0, color="black", linewidth=1)
+    axes[1].set_xlabel("")
+    axes[1].set_ylabel("Joint R2 - cell-type R2")
+    axes[1].set_title("ADAR-family gain")
+
+    if "n_clusters" in df.columns:
+        for idx, row in df.reset_index(drop=True).iterrows():
+            axes[1].text(
+                idx,
+                row["delta_r2"],
+                f"n={int(row['n_clusters'])}",
+                ha="center",
+                va="bottom" if row["delta_r2"] >= 0 else "top",
+                fontsize=8,
+            )
+
+    plt.tight_layout()
+
+    return fig, axes, df, long_df
 
 
 # =============================================================================
