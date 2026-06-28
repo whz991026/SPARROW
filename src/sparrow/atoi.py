@@ -1215,27 +1215,62 @@ def plot_cluster_level_obs_panel(
     summary_df = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
     return fig, axes, summary_df
 
-def _safe_moran_geary(values, coords, spatial_k=6, permutations=999):
-    mask = np.isfinite(values)
-
-    if mask.sum() <= spatial_k + 2 or np.nanstd(values[mask]) == 0:
-        return np.nan, np.nan, np.nan, np.nan
-
+def _safe_moran_geary(
+    ratio,
+    coords,
+    spatial_k=6,
+    permutations=999,
+    seed=None,
+):
     try:
-        from libpysal.weights import KNN
-        from esda.geary import Geary
-        from esda.moran import Moran
+        if seed is not None:
+            np.random.seed(seed)
 
-        w = KNN.from_array(coords[mask], k=min(spatial_k, mask.sum() - 1))
-        w.transform = "R"
+        x = np.asarray(ratio, dtype=float)
+        coords = np.asarray(coords)
 
-        moran = Moran(values[mask], w, permutations=permutations)
-        geary = Geary(values[mask], w, permutations=permutations)
+        valid = np.isfinite(x)
+        x_valid = x[valid]
+        coords_valid = coords[valid]
 
-        return float(moran.I), float(moran.p_sim), float(geary.C), float(geary.p_sim)
+        if len(x_valid) < spatial_k + 2:
+            return np.nan, np.nan, np.nan, np.nan
 
-    except Exception as exc:
-        warnings.warn(f"Moran/Geary failed; returning NaN spatial statistics: {exc}")
+        if np.nanstd(x_valid) == 0:
+            return np.nan, np.nan, np.nan, np.nan
+
+        knn = libpysal.weights.KNN.from_array(coords_valid, k=spatial_k)
+        knn.transform = "r"
+
+        moran = Moran(
+            x_valid,
+            knn,
+            permutations=permutations,
+        )
+
+        geary = Geary(
+            x_valid,
+            knn,
+            permutations=permutations,
+        )
+
+        moran_I = float(moran.I)
+
+        if permutations and permutations > 0:
+            moran_p = float(moran.p_sim)
+        else:
+            moran_p = float(moran.p_norm)
+
+        geary_C = float(geary.C)
+
+        if permutations and permutations > 0:
+            geary_p = float(geary.p_sim)
+        else:
+            geary_p = float(geary.p_norm)
+
+        return moran_I, moran_p, geary_C, geary_p
+
+    except Exception:
         return np.nan, np.nan, np.nan, np.nan
 
 def compute_obs_spatial_autocorrelation(
@@ -1354,6 +1389,7 @@ def detect_spatial_atoi_sites(
     p_cutoff=None,
     sv_call_by="fdr",
     permutations=999,
+    seed=123,
     a_layer="A",
     g_layer="G",
     store_key="sv_atoi",
@@ -1362,11 +1398,69 @@ def detect_spatial_atoi_sites(
     """
     Detect spatially variable A-to-I sites.
 
-    sv_call_by:
+    Parameters
+    ----------
+    adata_ai : AnnData
+        AnnData object containing A/G count layers and spatial coordinates.
+
+    group_key : str or None
+        Observation column used for group-level Kruskal-Wallis test.
+
+    min_cov : int
+        Minimum A + G coverage required for a spot to be valid.
+
+    min_valid_spots : int
+        Minimum number of valid spots required for one A-to-I site.
+
+    min_total_A : int
+        Minimum total A count across valid spots.
+
+    min_total_G : int
+        Minimum total G count across valid spots.
+
+    min_ratio_sd : float
+        Minimum standard deviation of editing ratio across valid spots.
+
+    spatial_k : int
+        Number of nearest spatial neighbors for Moran's I / Geary's C.
+
+    fdr_cutoff : float
+        FDR cutoff for SV-A-to-I calling.
+
+    p_cutoff : float or None
+        Raw p-value cutoff. If None, uses fdr_cutoff.
+
+    sv_call_by : {"fdr", "p", "either"}
         "fdr"    : moran_fdr < fdr_cutoff
         "p"      : moran_p < p_cutoff
         "either" : moran_fdr < fdr_cutoff OR moran_p < p_cutoff
+
+    permutations : int
+        Number of permutations used in Moran's I / Geary's C.
+
+    seed : int or None
+        Random seed for permutation-based p-values.
+        If None, results are not forced to be reproducible.
+        If an integer, each site uses seed + site_index.
+
+    a_layer : str
+        Layer name for A counts.
+
+    g_layer : str
+        Layer name for G counts.
+
+    store_key : str
+        Key used to store result table in adata_ai.uns.
+
+    verbose : bool
+        Whether to print progress and summary.
+
+    Returns
+    -------
+    res : pandas.DataFrame
+        Table of spatial A-to-I site statistics.
     """
+
     if p_cutoff is None:
         p_cutoff = fdr_cutoff
 
@@ -1416,16 +1510,22 @@ def detect_spatial_atoi_sites(
         group_n = 0
 
         if pass_qc:
+            site_seed = None if seed is None else int(seed) + int(j)
+
             moran_I, moran_p, geary_C, geary_p = _safe_moran_geary(
                 ratio,
                 coords,
                 spatial_k=spatial_k,
                 permutations=permutations,
+                seed=site_seed,
             )
 
             if groups is not None:
                 tmp = pd.DataFrame(
-                    {"ratio": ratio, "group": groups.values},
+                    {
+                        "ratio": ratio,
+                        "group": groups.values,
+                    },
                     index=adata_ai.obs_names,
                 ).dropna()
 
@@ -1469,6 +1569,8 @@ def detect_spatial_atoi_sites(
                 "group_n": group_n,
                 "group_kw_stat": kw_stat,
                 "group_kw_p": kw_p,
+                "seed": seed,
+                "site_seed": None if seed is None else int(seed) + int(j),
             }
         )
 
@@ -1507,6 +1609,7 @@ def detect_spatial_atoi_sites(
     res["sv_call_by"] = sv_call_by
     res["fdr_cutoff"] = fdr_cutoff
     res["p_cutoff"] = p_cutoff
+    res["permutations"] = permutations
 
     res = res.sort_values(
         ["is_sv_atoi", "moran_fdr", "moran_p", "moran_I"],
@@ -1519,8 +1622,12 @@ def detect_spatial_atoi_sites(
         print(f"QC-passing sites: {int(res['pass_qc'].sum())}")
         print(f"SV-A-to-I sites ({call_text}): {int(res['is_sv_atoi'].sum())}")
 
-    return res
+        if seed is not None:
+            print(f"Permutation seed: {seed}，site-level seed = seed + site_index")
+        else:
+            print("Permutation seed: None，results may vary between runs")
 
+    return res
 def summarize_top_sv_atoi_sites(
     sv_atoi: pd.DataFrame,
     top_n: int = 20,
