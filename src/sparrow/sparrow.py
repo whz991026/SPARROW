@@ -74,7 +74,19 @@ class SPARROW:
     weight_decay : float, default=0.0
         Weight decay used by the Adam optimizer.
     epochs : int, default=600
-        Number of epochs for training the spatial encoder.
+        Number of epochs for training the spatial encoder. Recommended values
+        depend on the training configuration and spatial technology. For 10x
+        Visium data, typical settings are 600 epochs for contrastive learning
+        only, 1000 epochs for contrastive learning with masked autoencoder
+        reconstruction, 600 epochs for contrastive learning with dynamic graph
+        updating, and 1200 epochs for contrastive learning with both masked
+        autoencoder reconstruction and dynamic graph updating. For high-
+        resolution Stereo-seq or Slide-seq data, typical settings are 1000
+        epochs for contrastive learning only and 1200 epochs for contrastive
+        learning with masked autoencoder reconstruction. Dynamic graph updating
+        on Stereo-seq or Slide-seq data can be computationally expensive and is
+        therefore not recommended for routine large-scale runs unless additional
+        runtime is acceptable.
     epochs_sc : int, default=600
         Number of epochs for training the single-cell autoencoder.
     epochs_map : int, default=1000
@@ -109,6 +121,12 @@ class SPARROW:
         Number of highly variable A-to-I features selected from ``adata_ai``.
     dynamic_graph : bool, default=False
         Whether to update the graph during training using learned embeddings.
+        When ``False``, SPARROW uses the initial spatial graph throughout
+        training. When ``True``, the graph is periodically updated from the
+        learned latent embeddings after ``dynamic_start_epoch``. This option
+        corresponds to the dynamic graph variants of SPARROW and is usually
+        used with ``dynamic_start_epoch=200``,
+        ``dynamic_update_interval=100``, and ``dynamic_k=10``.
     dynamic_update_interval : int, default=100
         Number of epochs between dynamic graph updates.
     dynamic_k : int, default=10
@@ -385,12 +403,42 @@ class SPARROW:
     def train(self, mask_rate=0.0, visible_rate=1):
         """Train the spatial encoder.
 
+        SPARROW supports four common spatial encoder training configurations:
+
+        1. Contrastive learning only
+            Set ``dynamic_graph=False`` when initializing ``SPARROW`` and call
+            ``train(mask_rate=0)``. For 10x Visium data, 600 epochs is generally
+            recommended. For Stereo-seq or Slide-seq data, 1000 epochs is
+            generally recommended.
+
+        2. Contrastive learning with masked autoencoder reconstruction
+            Set ``dynamic_graph=False`` and call ``train(mask_rate=0.2)``. For
+            10x Visium data, 1000 epochs is generally recommended. For
+            Stereo-seq or Slide-seq data, 1200 epochs is generally recommended.
+
+        3. Contrastive learning with dynamic graph updating
+            Set ``dynamic_graph=True`` and call ``train(mask_rate=0)``. For 10x
+            Visium data, 600 epochs is generally recommended, with
+            ``dynamic_start_epoch=200``, ``dynamic_update_interval=100``, and
+            ``dynamic_k=10``. Dynamic graph updating on Stereo-seq or Slide-seq
+            data may be substantially slower and is not recommended for routine
+            large-scale runs unless the additional computational cost is
+            acceptable.
+
+        4. Contrastive learning with both masked autoencoder reconstruction and
+           dynamic graph updating
+            Set ``dynamic_graph=True`` and call ``train(mask_rate=0.2)``. For
+            10x Visium data, 1200 epochs is generally recommended, with
+            ``dynamic_start_epoch=200``, ``dynamic_update_interval=100``, and
+            ``dynamic_k=10``.
+
         Parameters
         ----------
         mask_rate : float, default=0.0
             Fraction of input feature values randomly masked during training.
-            ``0.0`` uses standard reconstruction; values greater than 0 enable
-            masked autoencoder-style reconstruction.
+            ``0.0`` uses standard reconstruction, whereas values greater than
+            0 enable masked autoencoder-style reconstruction. A value of
+            ``0.2`` is the recommended default for MAE-enabled SPARROW runs.
         visible_rate : float, default=1
             Weight for reconstruction loss on visible entries when
             ``mask_rate > 0``.
