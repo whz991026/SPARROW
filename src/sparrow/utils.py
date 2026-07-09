@@ -83,7 +83,7 @@ def mclust_R(adata, num_cluster, modelNames="EEE", used_obsm="emb_pca", random_s
                 "Mclust failed to converge. The data may be singular or too high-dimensional."
             )
 
-    adata.obs["mclust"] = np.array(res.rx2("classification")).astype(int).astype("category")
+    adata.obs["mclust"] = pd.Categorical(np.array(res.rx2("classification")).astype(int).astype(str))
     return adata
 
 
