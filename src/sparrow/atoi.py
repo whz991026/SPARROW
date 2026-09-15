@@ -1,9 +1,7 @@
-# =============================================================================
-# atoi_necessary.py
-# Minimal A-to-I utilities used by DLPFC_AtoI_improved_workflow.ipynb.
-# Generated from atoi.py by retaining notebook-called functions and dependencies.
-# =============================================================================
+"""Functions and required helpers used by DLPFC_AtoI_improved_workflow_new.ipynb.
 
+All project analysis, plotting, cell-type grouping and PDF export live here.
+"""
 from __future__ import annotations
 
 import re
@@ -12,70 +10,36 @@ import mmap
 import warnings
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple, Union
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import statsmodels.api as sm
-
 from scipy import sparse
-from scipy.stats import kruskal, spearmanr, pearsonr, mannwhitneyu
+from scipy.stats import spearmanr, pearsonr, mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 from matplotlib.patches import Patch
+from scipy.linalg import qr
+from scipy.optimize import minimize
+from scipy.special import expit, logit, gammaln
+from scipy.stats import chi2
+import unicodedata
 
+__all__ = ['add_celltype_composition_modules', 'add_gene_expression_to_obs', 'add_obs_zmean_score', 'analyze_adar_spatial_correlation', 'analyze_score_vs_celltypes', 'analyze_single_site_wm_enrichment', 'analyze_wm_enrichment_for_sv_sites', 'annotate_sv_atoi_sites', 'collapse_deconvolution_to_clusters', 'compute_global_atoi_ratio', 'compute_multisite_atoi_score', 'compute_obs_spatial_autocorrelation', 'compute_sv_atoi_score', 'detect_spatial_atoi_sites_counts', 'filter_atoi_sites', 'fit_adjustment_model', 'fit_joint_atoi_model', 'infer_sv_site_mechanism_context', 'install_figure_pdf_export', 'parse_dlpfc_celltype_group', 'plot_bivariate_colocalization', 'plot_celltype_module_deconvolution_summary', 'plot_cluster_adar_correlation_heatmap', 'plot_cluster_level_obs_panel', 'plot_cluster_level_obs_value', 'plot_cluster_score_comparison', 'plot_count_spatial_discovery', 'plot_cross_sample_r2_decomposition', 'plot_cross_sample_recurrent_site_wm_boxplot', 'plot_cross_sample_sv_score_wm_enrichment', 'plot_external_overlap_summary', 'plot_global_atoi_two_r2_donuts', 'plot_residual_progression', 'plot_site_mechanism_context', 'plot_top_sv_site_patterns', 'run_core_analysis', 'run_sv_external_mechanism_overlaps', 'set_spatial_background', 'summarize_top_sv_atoi_sites', 'transfer_obs_metadata']
 
 _SPATIAL_IMAGE_CACHE = {}
+
 _EXTERNAL_GENE_FILTER_CACHE = {}
 
-
-# =============================================================================
-# Basic helpers
-# =============================================================================
-
-
-__all__ = [
-    'add_celltype_composition_modules',
-    'add_gene_expression_to_obs',
-    'add_obs_zmean_score',
-    'analyze_adar_spatial_correlation',
-    'analyze_score_vs_celltypes',
-    'analyze_single_site_wm_enrichment',
-    'analyze_wm_enrichment_for_sv_sites',
-    'annotate_sv_atoi_sites',
-    'collapse_deconvolution_to_clusters',
-    'compute_global_atoi_ratio',
-    'compute_multisite_atoi_score',
-    'compute_obs_spatial_autocorrelation',
-    'compute_sv_atoi_score',
-    'detect_spatial_atoi_sites',
-    'filter_atoi_sites',
-    'fit_adjustment_model',
-    'fit_joint_atoi_model',
-    'infer_sv_site_mechanism_context',
-    'plot_bivariate_colocalization',
-    'plot_celltype_module_deconvolution_summary',
-    'plot_cluster_adar_correlation_heatmap',
-    'plot_cluster_level_obs_panel',
-    'plot_cluster_level_obs_value',
-    'plot_cluster_score_comparison',
-    'plot_cross_sample_r2_decomposition',
-    'plot_cross_sample_recurrent_site_wm_boxplot',
-    'plot_cross_sample_sv_score_wm_enrichment',
-    'plot_external_overlap_summary',
-    'plot_global_atoi_two_r2_donuts',
-    'plot_residual_progression',
-    'plot_site_mechanism_context',
-    'plot_sv_atoi_discovery_landscape',
-    'plot_top_sv_site_patterns',
-    'run_sv_external_mechanism_overlaps',
-    'set_spatial_background',
-    'summarize_top_sv_atoi_sites',
-    'transfer_obs_metadata',
-]
+QUALITY_PROFILES = {
+    'Q20': dict(mapq=20, baseq=20, end_distance=0, unique=False),
+    'Q30_unique': dict(mapq=30, baseq=30, end_distance=0, unique=True),
+    'Q30_unique_end5': dict(mapq=30, baseq=30, end_distance=5, unique=True),
+}
 
 def _as_csr(x):
     return x.tocsr() if sparse.issparse(x) else x
+
 
 def _get_count_layers(adata_ai, a_layer: str = "A", g_layer: str = "G"):
     if a_layer not in adata_ai.layers:
@@ -85,13 +49,16 @@ def _get_count_layers(adata_ai, a_layer: str = "A", g_layer: str = "G"):
 
     return _as_csr(adata_ai.layers[a_layer]), _as_csr(adata_ai.layers[g_layer])
 
+
 def _dense_col(x, j: int) -> np.ndarray:
     if sparse.issparse(x):
         return np.asarray(x[:, j].toarray()).ravel()
     return np.asarray(x[:, j]).ravel()
 
+
 def _dense_sum(x, axis: int) -> np.ndarray:
     return np.asarray(x.sum(axis=axis)).ravel()
+
 
 def _coords_from_adata(adata) -> np.ndarray:
     if "spatial" in adata.obsm:
@@ -105,6 +72,7 @@ def _coords_from_adata(adata) -> np.ndarray:
         "No spatial coordinates found. Need adata.obsm['spatial'] "
         "or obs columns such as x_pixel/y_pixel."
     )
+
 
 def set_spatial_background(
     adata,
@@ -147,9 +115,11 @@ def set_spatial_background(
 
     return adata
 
+
 def _spatial_plot_config(adata) -> dict:
     cfg = adata.uns.get("spatial_background", {})
     return cfg if isinstance(cfg, dict) else {}
+
 
 def _plot_coords_from_adata(adata) -> np.ndarray:
     coords = _coords_from_adata(adata).astype(float, copy=True)
@@ -162,6 +132,7 @@ def _plot_coords_from_adata(adata) -> np.ndarray:
 
     return coords
 
+
 def _load_spatial_image(image_path: str):
     image_path = str(image_path)
 
@@ -169,6 +140,7 @@ def _load_spatial_image(image_path: str):
         _SPATIAL_IMAGE_CACHE[image_path] = plt.imread(image_path)
 
     return _SPATIAL_IMAGE_CACHE[image_path]
+
 
 def _draw_spatial_background(ax, adata, x, y) -> bool:
     cfg = _spatial_plot_config(adata)
@@ -214,6 +186,7 @@ def _draw_spatial_background(ax, adata, x, y) -> bool:
 
     return True
 
+
 def _zscore_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = df.astype(float).copy()
 
@@ -225,6 +198,7 @@ def _zscore_frame(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = 0.0
 
     return out
+
 
 def add_obs_zmean_score(
     adata,
@@ -255,10 +229,12 @@ def add_obs_zmean_score(
 
     return pd.Series(score, index=adata.obs_names, name=score_name)
 
+
 def _safe_multipletest(pvals, method="fdr_bh"):
     p = pd.Series(pvals).astype(float).fillna(1.0)
     p = p.clip(lower=np.nextafter(0, 1), upper=1.0)
     return multipletests(p.values, method=method)[1]
+
 
 def _safe_corr(x, y, method="spearman"):
     df = pd.DataFrame({"x": x, "y": y}).replace([np.inf, -np.inf], np.nan).dropna()
@@ -279,6 +255,7 @@ def _safe_corr(x, y, method="spearman"):
         raise ValueError("method must be 'spearman' or 'pearson'.")
 
     return float(rho), float(pval), int(df.shape[0])
+
 
 def _valid_group_series(adata, group_key="ground_truth", index=None):
     """
@@ -304,6 +281,7 @@ def _valid_group_series(adata, group_key="ground_truth", index=None):
 
     return s
 
+
 def _map_group_mean_to_spots(values, labels):
     """
     Map group-level mean values back to each spot.
@@ -323,6 +301,7 @@ def _map_group_mean_to_spots(values, labels):
     out.loc[valid] = labels.loc[valid].map(group_mean).astype(float)
 
     return out.values
+
 
 def _aggregate_analysis_frame_by_group(
     adata_ai,
@@ -385,6 +364,7 @@ def _aggregate_analysis_frame_by_group(
 
     return out, labels
 
+
 def collapse_deconvolution_to_clusters(
     adata_ai,
     df_deconv: pd.DataFrame,
@@ -445,6 +425,7 @@ def collapse_deconvolution_to_clusters(
 
     return cluster_df, spot_df, group_counts
 
+
 def add_celltype_composition_modules(
     df_deconv: pd.DataFrame,
     module_map: Optional[dict] = None,
@@ -503,6 +484,7 @@ def add_celltype_composition_modules(
     module_members = pd.DataFrame(rows, columns=["module", "members", "n_members"])
 
     return df_out, module_cols, module_members
+
 
 def plot_celltype_module_deconvolution_summary(
     adata_ai,
@@ -579,6 +561,7 @@ def plot_celltype_module_deconvolution_summary(
 
     return fig, {"maps": map_axes, "bar": bar_ax}, cluster_summary
 
+
 def transfer_obs_metadata(
     source_adata,
     target_adata,
@@ -610,6 +593,7 @@ def transfer_obs_metadata(
         target_adata.obsm["spatial"] = target_adata.obs[["x_pixel", "y_pixel"]].values
 
     return target_adata
+
 
 def filter_atoi_sites(
     adata_ai,
@@ -694,6 +678,7 @@ def filter_atoi_sites(
 
     return adata_out, keep
 
+
 def _site_ratio_matrix(
     adata_ai,
     site_idx: Sequence[int],
@@ -719,6 +704,7 @@ def _site_ratio_matrix(
         coverages.append(cov)
 
     return np.vstack(ratios).T, np.vstack(coverages).T
+
 
 def _resolve_site_list(
     adata_ai,
@@ -769,6 +755,7 @@ def _resolve_site_list(
 
     return site_names, weights
 
+
 def select_atoi_score_sites(
     sv_atoi: pd.DataFrame,
     adata_ai=None,
@@ -793,6 +780,24 @@ def select_atoi_score_sites(
         df = df[df["site"].astype(str).isin(adata_ai.var_names)].copy()
 
     primary = df.copy()
+
+    # Count-model results retain their own statistics; never relabel as Moran I.
+    if "spatial_fdr" in df.columns:
+        primary = df.loc[df["fit_status"].eq("ok")].copy()
+        if require_sv:
+            primary = primary.loc[primary["is_sv_atoi"]].copy()
+        source = "called_sv_atoi" if require_sv else "ranked_count_model"
+        if primary.empty and fallback_to_ranked:
+            primary = df.loc[df["pass_qc"] & df["fit_status"].eq("ok")].copy()
+            source = "exploratory_count_model_fallback"
+        primary["score_site_source"] = source
+        primary = primary.sort_values(["spatial_fdr", "spatial_p", "spatial_effect"],
+                                      ascending=[True, True, False])
+        if top_n is not None:
+            primary = primary.head(top_n)
+        if primary.empty:
+            raise ValueError("No count-model A-to-I score sites were selected.")
+        return primary.reset_index(drop=True)
 
     if require_sv and "is_sv_atoi" in primary.columns:
         primary = primary[primary["is_sv_atoi"] == True].copy()
@@ -835,6 +840,7 @@ def select_atoi_score_sites(
 
     return primary.reset_index(drop=True)
 
+
 def compute_sv_atoi_score(
     adata_ai,
     sv_atoi: pd.DataFrame,
@@ -875,6 +881,7 @@ def compute_sv_atoi_score(
     adata_ai.uns[f"{score_name}_site_table"] = score_sites
 
     return score, score_sites
+
 
 def compute_multisite_atoi_score(
     adata_ai,
@@ -952,6 +959,7 @@ def compute_multisite_atoi_score(
 
     return pd.Series(score, index=adata_ai.obs_names, name=score_name)
 
+
 def compute_global_atoi_ratio(
     adata_ai,
     ratio_key: str = "global_atoi_ratio",
@@ -979,6 +987,7 @@ def compute_global_atoi_ratio(
 
     return pd.Series(ratio, index=adata_ai.obs_names, name=ratio_key)
 
+
 def get_site_editing_ratio(
     adata_ai,
     site: str,
@@ -1002,6 +1011,7 @@ def get_site_editing_ratio(
     ratio[valid] = g[valid] / cov[valid]
 
     return pd.Series(ratio, index=adata_ai.obs_names, name=site)
+
 
 def _spatial_axes(
     ax,
@@ -1066,6 +1076,7 @@ def _spatial_axes(
     ax.axis("off")
 
     return sc
+
 
 def plot_cluster_level_obs_value(
     adata,
@@ -1163,6 +1174,7 @@ def plot_cluster_level_obs_value(
 
     return fig, axes, summary
 
+
 def plot_cluster_level_obs_panel(
     adata,
     value_keys: Sequence[str],
@@ -1215,6 +1227,7 @@ def plot_cluster_level_obs_panel(
     summary_df = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
     return fig, axes, summary_df
 
+
 def _safe_moran_geary(values, coords, spatial_k=6, permutations=999, random_state=None):
     mask = np.isfinite(values)
 
@@ -1246,6 +1259,7 @@ def _safe_moran_geary(values, coords, spatial_k=6, permutations=999, random_stat
     except Exception as exc:
         warnings.warn(f"Moran/Geary failed; returning NaN spatial statistics: {exc}")
         return np.nan, np.nan, np.nan, np.nan
+
 
 def compute_obs_spatial_autocorrelation(
     adata_ai,
@@ -1358,201 +1372,6 @@ def compute_obs_spatial_autocorrelation(
 
     return res
 
-def detect_spatial_atoi_sites(
-    adata_ai,
-    group_key="ground_truth",
-    min_cov=10,
-    min_valid_spots=30,
-    min_total_A=30,
-    min_total_G=30,
-    min_ratio_sd=0.03,
-    spatial_k=6,
-    fdr_cutoff=0.05,
-    p_cutoff=None,
-    sv_call_by="fdr",
-    permutations=999,
-    random_state: Optional[int] = 0,
-    seed: Optional[int] = None,
-    a_layer="A",
-    g_layer="G",
-    store_key="sv_atoi",
-    verbose=True,
-):
-    """
-    Detect spatially variable A-to-I sites.
-
-    random_state controls the permutation p values from esda.Moran/Geary.
-    Moran's I and Geary's C statistics themselves are deterministic.
-    seed is accepted as a backward-compatible alias for random_state.
-
-    sv_call_by:
-        "fdr"    : moran_fdr < fdr_cutoff
-        "p"      : moran_p < p_cutoff
-        "either" : moran_fdr < fdr_cutoff OR moran_p < p_cutoff
-    """
-    if seed is not None:
-        random_state = seed
-
-    if p_cutoff is None:
-        p_cutoff = fdr_cutoff
-
-    sv_call_by = str(sv_call_by).lower()
-
-    if sv_call_by not in ["fdr", "p", "either"]:
-        raise ValueError("sv_call_by must be one of: 'fdr', 'p', 'either'.")
-
-    coords = _coords_from_adata(adata_ai)
-
-    if group_key is not None and group_key in adata_ai.obs.columns:
-        groups = _valid_group_series(adata_ai, group_key=group_key)
-    else:
-        groups = None
-
-    A, G = _get_count_layers(adata_ai, a_layer=a_layer, g_layer=g_layer)
-
-    rows = []
-    rng = np.random.default_rng(random_state) if random_state is not None else None
-
-    for j, site in enumerate(adata_ai.var_names):
-        a = _dense_col(A, j)
-        g = _dense_col(G, j)
-        cov = a + g
-
-        valid = cov >= min_cov
-
-        ratio = np.full(adata_ai.n_obs, np.nan, dtype=float)
-        ratio[valid] = g[valid] / cov[valid]
-
-        n_valid = int(valid.sum())
-        total_A = float(a[valid].sum())
-        total_G = float(g[valid].sum())
-
-        mean_ratio = float(np.nanmean(ratio)) if n_valid > 0 else np.nan
-        sd_ratio = float(np.nanstd(ratio)) if n_valid > 0 else np.nan
-
-        pass_qc = (
-            (n_valid >= min_valid_spots)
-            and (total_A >= min_total_A)
-            and (total_G >= min_total_G)
-            and np.isfinite(sd_ratio)
-            and (sd_ratio >= min_ratio_sd)
-        )
-
-        moran_I = moran_p = geary_C = geary_p = np.nan
-        kw_stat = kw_p = np.nan
-        group_n = 0
-
-        if pass_qc:
-            moran_I, moran_p, geary_C, geary_p = _safe_moran_geary(
-                ratio,
-                coords,
-                spatial_k=spatial_k,
-                permutations=permutations,
-                random_state=(
-                    int(rng.integers(0, np.iinfo(np.int32).max))
-                    if rng is not None
-                    else None
-                ),
-            )
-
-            if groups is not None:
-                tmp = pd.DataFrame(
-                    {"ratio": ratio, "group": groups.values},
-                    index=adata_ai.obs_names,
-                ).dropna()
-
-                vals = [
-                    sub["ratio"].dropna().values
-                    for _, sub in tmp.groupby("group", observed=True)
-                ]
-                vals = [v for v in vals if len(v) >= 3]
-                group_n = len(vals)
-
-                if group_n >= 2:
-                    try:
-                        kw_stat, kw_p = kruskal(*vals)
-                        kw_stat = float(kw_stat)
-                        kw_p = float(kw_p)
-                    except Exception:
-                        kw_stat = np.nan
-                        kw_p = np.nan
-
-        gene = ""
-
-        if "Gene.refGene" in adata_ai.var.columns:
-            gene = adata_ai.var.iloc[j].get("Gene.refGene", "")
-
-        rows.append(
-            {
-                "site": site,
-                "gene": gene,
-                "n_valid_spots": n_valid,
-                "total_A_valid": total_A,
-                "total_G_valid": total_G,
-                "total_cov_valid": total_A + total_G,
-                "mean_ratio": mean_ratio,
-                "sd_ratio": sd_ratio,
-                "pass_qc": bool(pass_qc),
-                "moran_I": moran_I,
-                "moran_p": moran_p,
-                "geary_C": geary_C,
-                "geary_p": geary_p,
-                "random_state": random_state,
-                "group_key": group_key,
-                "group_n": group_n,
-                "group_kw_stat": kw_stat,
-                "group_kw_p": kw_p,
-            }
-        )
-
-        if verbose and (j + 1) % 500 == 0:
-            print(f"Processed {j + 1}/{adata_ai.n_vars} A-to-I sites")
-
-    res = pd.DataFrame(rows)
-
-    res["moran_fdr"] = np.nan
-    res["group_kw_fdr"] = np.nan
-
-    qc = res["pass_qc"].values
-
-    if qc.any():
-        res.loc[qc, "moran_fdr"] = _safe_multipletest(res.loc[qc, "moran_p"])
-        res.loc[qc, "group_kw_fdr"] = _safe_multipletest(res.loc[qc, "group_kw_p"])
-
-    if sv_call_by == "fdr":
-        sig = res["moran_fdr"] < fdr_cutoff
-        call_text = f"Moran FDR < {fdr_cutoff}"
-
-    elif sv_call_by == "p":
-        sig = res["moran_p"] < p_cutoff
-        call_text = f"Moran p < {p_cutoff}"
-
-    else:
-        sig = (res["moran_fdr"] < fdr_cutoff) | (res["moran_p"] < p_cutoff)
-        call_text = f"Moran FDR < {fdr_cutoff} OR Moran p < {p_cutoff}"
-
-    res["is_sv_atoi"] = (
-        res["pass_qc"]
-        & (res["moran_I"] > 0)
-        & sig.fillna(False)
-    )
-
-    res["sv_call_by"] = sv_call_by
-    res["fdr_cutoff"] = fdr_cutoff
-    res["p_cutoff"] = p_cutoff
-
-    res = res.sort_values(
-        ["is_sv_atoi", "moran_fdr", "moran_p", "moran_I"],
-        ascending=[False, True, True, False],
-    ).reset_index(drop=True)
-
-    adata_ai.uns[store_key] = res
-
-    if verbose:
-        print(f"QC-passing sites: {int(res['pass_qc'].sum())}")
-        print(f"SV-A-to-I sites ({call_text}): {int(res['is_sv_atoi'].sum())}")
-
-    return res
 
 def summarize_top_sv_atoi_sites(
     sv_atoi: pd.DataFrame,
@@ -1571,6 +1390,19 @@ def summarize_top_sv_atoi_sites(
         raise ValueError("sv_atoi is empty.")
 
     df = sv_atoi.copy()
+
+    if "spatial_fdr" in df.columns:
+        df = df.loc[df["fit_status"].eq("ok")].copy()
+        if require_sv:
+            df = df.loc[df["is_sv_atoi"]].copy()
+        if fdr_cutoff is not None:
+            df = df.loc[df["spatial_fdr"] < fdr_cutoff]
+        df = df.sort_values(["spatial_fdr", "spatial_p", "spatial_effect"],
+                            ascending=[True, True, False]).head(top_n).reset_index(drop=True)
+        df.insert(0, "rank", np.arange(1, len(df) + 1))
+        if store_in is not None:
+            store_in.uns[store_key] = df
+        return df
 
     if require_sv and "is_sv_atoi" in df.columns:
         df = df[df["is_sv_atoi"] == True].copy()
@@ -1620,6 +1452,7 @@ def summarize_top_sv_atoi_sites(
         store_in.uns[store_key] = out
 
     return out
+
 
 def analyze_wm_enrichment_for_sv_sites(
     adata_ai,
@@ -1753,6 +1586,7 @@ def analyze_wm_enrichment_for_sv_sites(
 
     return res
 
+
 def plot_cross_sample_sv_score_wm_enrichment(
     wm_enrichment: pd.DataFrame,
     sample_col: str = "sample_id",
@@ -1829,6 +1663,7 @@ def plot_cross_sample_sv_score_wm_enrichment(
 
     return fig, ax, df
 
+
 def analyze_single_site_wm_enrichment(
     adata_ai,
     site: str,
@@ -1884,6 +1719,7 @@ def analyze_single_site_wm_enrichment(
     )
 
     return df, summary
+
 
 def plot_cross_sample_recurrent_site_wm_boxplot(
     ratio_df: pd.DataFrame,
@@ -2013,6 +1849,7 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     df["shown_in_stripplot"] = df.index.isin(plot_points.index)
     return fig, ax, df
 
+
 def annotate_sv_atoi_sites(
     adata_ai,
     sv_atoi: pd.DataFrame,
@@ -2040,9 +1877,9 @@ def annotate_sv_atoi_sites(
         adata_ai.uns[store_key] = out
         return out
 
-    sort_cols = [c for c in ["moran_fdr", "moran_p", "moran_I"] if c in df.columns]
+    sort_cols = [c for c in ["spatial_fdr", "spatial_p", "spatial_effect", "moran_fdr", "moran_p", "moran_I"] if c in df.columns]
     if sort_cols:
-        ascending = [False if c == "moran_I" else True for c in sort_cols]
+        ascending = [False if c in {"moran_I", "spatial_effect"} else True for c in sort_cols]
         df = df.sort_values(sort_cols, ascending=ascending)
 
     if top_n is not None:
@@ -2093,6 +1930,7 @@ def annotate_sv_atoi_sites(
 
     return adata_ai.uns[store_key]
 
+
 def _site_coordinate_table(sv_annotation: pd.DataFrame, site_col: str = "site"):
     if sv_annotation is None or sv_annotation.empty or site_col not in sv_annotation.columns:
         return pd.DataFrame()
@@ -2106,6 +1944,7 @@ def _site_coordinate_table(sv_annotation: pd.DataFrame, site_col: str = "site"):
     df["bed_end"] = df["pos_1based"]
     return df
 
+
 def _parse_gff3_attributes(attr):
     if pd.isna(attr):
         return {}
@@ -2115,6 +1954,7 @@ def _parse_gff3_attributes(attr):
             key, value = item.split("=", 1)
             out[key.strip()] = value.strip()
     return out
+
 
 def _read_external_annotation_file(path, annotation_type: str = "bed"):
     if path is None or str(path).strip() == "":
@@ -2191,6 +2031,7 @@ def _read_external_annotation_file(path, annotation_type: str = "bed"):
     df = pd.read_csv(path, sep=None, engine="python", comment="#", dtype=str, compression="infer")
     return df, "loaded"
 
+
 def _site_positions_by_chrom(sv_annotation: pd.DataFrame, site_col: str = "site"):
     sites = _site_coordinate_table(sv_annotation, site_col=site_col)
     out = {}
@@ -2199,6 +2040,7 @@ def _site_positions_by_chrom(sv_annotation: pd.DataFrame, site_col: str = "site"
     for _, row in sites.dropna(subset=["pos_1based"]).iterrows():
         out.setdefault(str(row["chrom_norm"]), set()).add(int(row["pos_1based"]))
     return out
+
 
 def _read_repeatmasker_filtered(path, sv_annotation: pd.DataFrame, site_col="site", flank=0):
     positions = _site_positions_by_chrom(sv_annotation, site_col=site_col)
@@ -2229,6 +2071,7 @@ def _read_repeatmasker_filtered(path, sv_annotation: pd.DataFrame, site_col="sit
                 }
             )
     return pd.DataFrame(rows), "loaded"
+
 
 def _read_rediportal_filtered(path, sv_annotation: pd.DataFrame, site_col="site"):
     positions = _site_positions_by_chrom(sv_annotation, site_col=site_col)
@@ -2306,6 +2149,7 @@ def _read_rediportal_filtered(path, sv_annotation: pd.DataFrame, site_col="site"
             df[col] = df0[col]
     return df, "loaded"
 
+
 def _standardize_interval_annotation(
     annot: pd.DataFrame,
     source: str,
@@ -2364,6 +2208,7 @@ def _standardize_interval_annotation(
 
     out = out.dropna(subset=["annot_start", "annot_end"])
     return out
+
 
 def overlap_sv_sites_with_interval_annotation(
     sv_annotation: pd.DataFrame,
@@ -2430,11 +2275,13 @@ def overlap_sv_sites_with_interval_annotation(
 
     return pd.DataFrame(rows)
 
+
 def _open_text_maybe_gzip(path):
     path = Path(path)
     if path.suffix.lower() == ".gz":
         return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
     return open(path, "rt", encoding="utf-8", errors="ignore")
+
 
 def _bed_file_first_name_matches(path, pattern: str) -> bool:
     try:
@@ -2449,6 +2296,7 @@ def _bed_file_first_name_matches(path, pattern: str) -> bool:
             name = parts[3] if len(parts) > 3 else ""
             return re.search(pattern, str(name), flags=re.IGNORECASE) is not None
     return False
+
 
 def overlap_sv_sites_with_bed_file_collection(
     sv_annotation: pd.DataFrame,
@@ -2543,6 +2391,7 @@ def overlap_sv_sites_with_bed_file_collection(
 
     return pd.DataFrame(rows)
 
+
 def overlap_sv_sites_with_gene_annotation(
     sv_annotation: pd.DataFrame,
     annot: pd.DataFrame,
@@ -2615,6 +2464,7 @@ def overlap_sv_sites_with_gene_annotation(
 
     return pd.DataFrame(rows)
 
+
 def _extract_site_gene_set(
     sv_annotation: pd.DataFrame,
     gene_cols: Sequence[str] = ("host_gene", "gene", "Gene.refGene"),
@@ -2627,6 +2477,7 @@ def _extract_site_gene_set(
             if col in sv_annotation.columns and pd.notna(row.get(col, np.nan)):
                 genes.update(g.strip().upper() for g in re.split(r"[;,|]", str(row[col])) if g.strip() and g.strip() != ".")
     return genes
+
 
 def _read_gene_annotation_filtered(
     path,
@@ -2686,6 +2537,7 @@ def _read_gene_annotation_filtered(
         result = pd.concat(pieces, ignore_index=True)
     _EXTERNAL_GENE_FILTER_CACHE[cache_key] = result.copy()
     return result, "loaded"
+
 
 def run_sv_external_mechanism_overlaps(
     sv_annotation: pd.DataFrame,
@@ -2861,6 +2713,7 @@ def run_sv_external_mechanism_overlaps(
 
     return detail_df, summary_df
 
+
 def infer_sv_site_mechanism_context(
     sv_annotation: pd.DataFrame,
     external_overlap_detail: Optional[pd.DataFrame] = None,
@@ -2936,6 +2789,7 @@ def infer_sv_site_mechanism_context(
 
     return base
 
+
 def plot_external_overlap_summary(
     overlap_summary: pd.DataFrame,
     figsize=(7.2, 3.8),
@@ -2983,6 +2837,7 @@ def plot_external_overlap_summary(
         ax.text(row["n_overlap_sites"], yi, f" {status}", va="center", fontsize=8)
     plt.tight_layout()
     return fig, ax
+
 
 def plot_site_mechanism_context(
     mechanism_df: pd.DataFrame,
@@ -3033,6 +2888,7 @@ def plot_site_mechanism_context(
     ax.legend(frameon=False, fontsize=8, title="", bbox_to_anchor=(1.02, 1), loc="upper left")
     plt.tight_layout()
     return fig, ax, df
+
 
 def prepare_rbp_followup_table(
     sv_annotation: pd.DataFrame,
@@ -3152,7 +3008,11 @@ def prepare_rbp_followup_table(
     df.loc[df["rbp_region_flag"] & df["mirna_context"], "followup_route"] = "RBP + miRNA/3UTR follow-up"
     df.loc[df["is_alu_or_repeat"], "followup_route"] = df.loc[df["is_alu_or_repeat"], "followup_route"].astype(str) + " + repeat/ADAR"
 
-    if "moran_fdr" in df.columns:
+    if "spatial_fdr" in df.columns:
+        priority_order = {"high": 0, "candidate": 1, "lower": 2}
+        df["_priority_order"] = df["rbp_followup_priority"].map(priority_order).fillna(9)
+        df = df.sort_values(["_priority_order", "spatial_fdr", "spatial_effect"], ascending=[True, True, False])
+    elif "moran_fdr" in df.columns:
         priority_order = {"high": 0, "candidate": 1, "lower": 2}
         df["_priority_order"] = df["rbp_followup_priority"].map(priority_order).fillna(9)
         df = df.sort_values(["_priority_order", "moran_fdr", "moran_I"], ascending=[True, True, False])
@@ -3178,6 +3038,10 @@ def prepare_rbp_followup_table(
         "has_repeat_annotation",
         "is_alu_or_repeat",
         "repeat_context",
+        "spatial_effect",
+        "spatial_lrt",
+        "spatial_p",
+        "spatial_fdr",
         "moran_I",
         "moran_p",
         "moran_fdr",
@@ -3192,99 +3056,6 @@ def prepare_rbp_followup_table(
 
     return df.loc[:, keep].reset_index(drop=True)
 
-def plot_sv_atoi_discovery_landscape(
-    sv_atoi: pd.DataFrame,
-    fdr_cutoff=0.05,
-    p_col: str = "moran_p",
-    p_cutoff: float = 0.05,
-    top_n_labels=8,
-    figsize=(12, 4),
-):
-    df = sv_atoi.copy()
-
-    if p_col not in df.columns:
-        p_col = "moran_fdr"
-
-    df[p_col] = pd.to_numeric(df[p_col], errors="coerce")
-    df["_plot_p_value"] = df[p_col].clip(lower=1e-300)
-    df["status"] = np.where(df["is_sv_atoi"], "SV-A-to-I", "not SV")
-
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-
-    counts = pd.Series(
-        {
-            "all sites": len(df),
-            "QC pass": int(df["pass_qc"].sum()),
-            "SV-A-to-I": int(df["is_sv_atoi"].sum()),
-        }
-    )
-
-    sns.barplot(x=counts.index, y=counts.values, ax=axes[0])
-    axes[0].set_ylabel("site count")
-    axes[0].set_xlabel("")
-    axes[0].set_title("Discovery funnel")
-    axes[0].tick_params(axis="x", rotation=25)
-
-    colors = df["status"].map({"not SV": "#bdbdbd", "SV-A-to-I": "#d95f02"})
-    sizes = np.clip(df["n_valid_spots"].astype(float) / 3, 12, 90)
-
-    mask = df["moran_I"].notna() & df["_plot_p_value"].notna()
-
-    axes[1].scatter(
-        df.loc[mask, "moran_I"],
-        df.loc[mask, "_plot_p_value"],
-        s=sizes.loc[mask],
-        c=colors.loc[mask],
-        linewidths=0,
-        alpha=0.75,
-    )
-
-    axes[1].axhline(p_cutoff, color="black", linestyle="--", linewidth=1)
-    axes[1].axvline(0, color="black", linewidth=0.8)
-    axes[1].set_xlabel("Moran's I")
-    axes[1].set_ylabel("Moran p value" if p_col == "moran_p" else p_col)
-    axes[1].set_title("Spatial autocorrelation")
-    axes[1].set_yscale("log")
-    axes[1].invert_yaxis()
-
-    label_df = (
-        df.sort_values(
-            ["is_sv_atoi", p_col, "moran_I"],
-            ascending=[False, True, False],
-        )
-        .head(top_n_labels)
-    )
-
-    for _, row in label_df.iterrows():
-        label = row["gene"] if isinstance(row.get("gene", ""), str) and row.get("gene", "") else row["site"]
-
-        if np.isfinite(row["moran_I"]) and np.isfinite(row["_plot_p_value"]):
-            axes[1].text(
-                row["moran_I"],
-                row["_plot_p_value"],
-                str(label)[:14],
-                fontsize=7,
-            )
-
-    colors2 = df["status"].map({"not SV": "#bdbdbd", "SV-A-to-I": "#7570b3"})
-    mask = df["n_valid_spots"].notna() & df["sd_ratio"].notna()
-
-    axes[2].scatter(
-        df.loc[mask, "n_valid_spots"],
-        df.loc[mask, "sd_ratio"],
-        c=colors2.loc[mask],
-        s=28,
-        linewidths=0,
-        alpha=0.75,
-    )
-
-    axes[2].set_xlabel("valid spots")
-    axes[2].set_ylabel("editing ratio SD")
-    axes[2].set_title("Coverage and variability")
-
-    plt.tight_layout()
-
-    return fig, axes
 
 def plot_top_sv_site_patterns(
     adata_ai,
@@ -3370,6 +3141,7 @@ def plot_top_sv_site_patterns(
 
     return fig, axes
 
+
 def add_gene_expression_to_obs(
     adata_expr,
     target_adata,
@@ -3406,6 +3178,7 @@ def add_gene_expression_to_obs(
         added.append(col)
 
     return added
+
 
 def analyze_adar_spatial_correlation(
     adata_ai,
@@ -3560,6 +3333,7 @@ def analyze_adar_spatial_correlation(
 
     return out
 
+
 def plot_cluster_adar_correlation_heatmap(
     corr_result,
     figsize=(4.6, 4.0),
@@ -3599,6 +3373,7 @@ def plot_cluster_adar_correlation_heatmap(
 
     return fig, ax
 
+
 def _bivariate_classes(x, y, q=0.5):
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -3622,6 +3397,7 @@ def _bivariate_classes(x, y, q=0.5):
     out[mask & x_hi & y_hi] = 3
 
     return out
+
 
 def _prepare_bivariate_values(
     adata,
@@ -3657,6 +3433,7 @@ def _prepare_bivariate_values(
         y_out.loc[valid] = labels.loc[valid].map(group_mean["y"]).astype(float)
 
     return x_out.values, y_out.values, x_out, y_out
+
 
 def plot_bivariate_colocalization(
     adata,
@@ -3748,6 +3525,7 @@ def plot_bivariate_colocalization(
     plt.tight_layout()
 
     return fig, axes
+
 
 def analyze_score_vs_celltypes(
     adata_ai,
@@ -3854,6 +3632,7 @@ def analyze_score_vs_celltypes(
     adata_ai.uns[store_key] = res
 
     return res
+
 
 def plot_cluster_score_comparison(
     adata,
@@ -3965,6 +3744,7 @@ def plot_cluster_score_comparison(
 
     return fig, {"maps": map_axes, "bar": bar_ax}, summary
 
+
 def plot_cross_sample_r2_decomposition(
     model_df: pd.DataFrame,
     sample_col: str = "sample_id",
@@ -4030,6 +3810,7 @@ def plot_cross_sample_r2_decomposition(
         value_name="variance_fraction",
     )
     return fig, ax, df, long_df
+
 
 def fit_adjustment_model(
     adata_ai,
@@ -4194,6 +3975,7 @@ def fit_adjustment_model(
 
     return residual, fit, params, summary
 
+
 def fit_joint_atoi_model(
     adata_ai,
     df_deconv,
@@ -4237,6 +4019,7 @@ def fit_joint_atoi_model(
         cluster_agg=cluster_agg,
         store_key=store_key,
     )
+
 
 def plot_residual_progression(
     adata_ai,
@@ -4411,6 +4194,7 @@ def plot_residual_progression(
 
     return fig, axes, summary
 
+
 def plot_global_atoi_two_r2_donuts(
     adata_ai,
     original_key="global_atoi_score",
@@ -4549,3 +4333,848 @@ def plot_global_atoi_two_r2_donuts(
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
     return fig, axes, summary
+
+
+def _linear_design(coords, n_knots=0, reference_coords=None):
+    reference = coords if reference_coords is None else reference_coords
+    center = reference.mean(axis=0)
+    z = coords - center
+    scale = np.ptp(reference, axis=0).max()
+    if scale <= 0:
+        return np.ones((len(coords), 1))
+    z /= scale
+    if n_knots:
+        support = np.unique((reference-center)/scale, axis=0)
+        chosen = [int(np.argmin(np.sum(support**2, axis=1)))]
+        for _ in range(min(n_knots, len(support))-1):
+            distance = ((support[:,None]-support[chosen])**2).sum(axis=2).min(axis=1)
+            chosen.append(int(np.argmax(distance)))
+        knots = support[chosen]
+        distance = np.sqrt(((knots[:,None]-knots)**2).sum(axis=2))
+        positive = distance[distance>0]
+        width = float(np.median(positive)) if positive.size else .5
+        rbf = np.exp(-((z[:,None]-knots)**2).sum(axis=2)/(2*width**2))
+        z = np.column_stack([z,rbf])
+    z -= z.mean(axis=0)
+    q, r, _ = qr(z, mode="economic", pivoting=True)
+    diag = np.abs(np.diag(r))
+    rank = int(np.sum(diag > max(z.shape) * np.finfo(float).eps * max(diag.max(), 1)))
+    return np.column_stack([np.ones(len(coords)), q[:, :rank] * np.sqrt(len(coords))])
+
+
+def _fit_binomial(g, n, x):
+    initial = np.zeros(x.shape[1])
+    initial[0] = logit(g.sum() / n.sum())
+    logchoose = gammaln(n+1)-gammaln(g+1)-gammaln(n-g+1)
+    def objective(beta):
+        eta = x @ beta
+        ll = np.sum(logchoose + g*eta - n*np.logaddexp(0, eta))
+        return -ll, x.T @ (n*expit(eta)-g)
+    fit = minimize(objective, initial, jac=True, method="L-BFGS-B",
+                   bounds=[(-30,30)]*x.shape[1],
+                   options={"maxiter":500,"maxls":50,"ftol":1e-9,"gtol":1e-5})
+    if not fit.success or not np.isfinite(fit.fun):
+        raise RuntimeError("optimizer did not converge")
+    if np.any(np.abs(fit.x)>=29.99):
+        raise RuntimeError("coefficient boundary / possible separation")
+    return -float(fit.fun), expit(x @ fit.x)
+
+
+def _select_common_k(adata_ai, candidates, store_key, verbose, kwargs):
+    tables, configs = {}, {}
+    old = {k:v for k,v in adata_ai.uns.items() if k==store_key or k.startswith(store_key+'_')}
+    try:
+        for k in candidates:
+            if verbose:
+                print('BIC selection: fitting K={}'.format(k), flush=True)
+            tables[k] = detect_spatial_atoi_sites_counts(adata_ai, n_knots=k,
+                store_key=store_key, verbose=False, **kwargs).set_index('site')
+            configs[k] = dict(adata_ai.uns[store_key+'_model_config'])
+    finally:
+        for key in list(adata_ai.uns):
+            if key==store_key or key.startswith(store_key+'_'):
+                del adata_ai.uns[key]
+        adata_ai.uns.update(old)
+    common = set(tables[candidates[0]].index)
+    for table in tables.values():
+        common &= set(table.index[table.pass_qc & table.fit_status.eq('ok')])
+    totals, audit = [], []
+    for k, table in tables.items():
+        bic = -2*table.loglik_spatial + (table.spatial_df+1)*np.log(table.n_valid_spots.clip(lower=1))
+        used = table.index.isin(common)
+        totals.append(dict(n_knots=k, n_selection_sites=len(common),
+            total_bic=float(bic.loc[used].sum()) if common else np.nan))
+        audit.append(pd.DataFrame(dict(site=table.index, n_knots=k, bic=bic.to_numpy(),
+            used_for_selection=used, fit_status=table.fit_status.to_numpy())))
+    summary = pd.DataFrame(totals)
+    adata_ai.uns[store_key+'_k_selection'] = summary
+    adata_ai.uns[store_key+'_k_selection_sites'] = pd.concat(audit,ignore_index=True)
+    if not common:
+        raise ValueError('No common successfully fitted sites across candidate K values; inspect the K-selection audit.')
+    selected = int(summary.sort_values(['total_bic','n_knots']).iloc[0].n_knots)
+    summary['selected'] = summary.n_knots.eq(selected)
+    result = tables[selected].reset_index()
+    result['p_method'] = 'asymptotic_chi2_conditional_on_selected_k'
+    result['k_selection_site'] = result.site.isin(common)
+    config = configs[selected]
+    config.update(n_knots='auto', selected_n_knots=selected, knot_candidates=candidates,
+        selection_scope='dataset', selection_adjusted=False,
+        selection_criterion='sum BIC on common successfully fitted sites; smaller K breaks ties')
+    adata_ai.uns[store_key] = result
+    adata_ai.uns[store_key+'_model_config'] = config
+    if verbose:
+        print('Selected shared K={} from {} common sites; p values conditional on selected K.'.format(selected,len(common)))
+    return result
+
+
+def detect_spatial_atoi_sites_counts(
+    adata_ai, min_cov=5, min_valid_spots=30, min_total_A=10, min_total_G=10,
+    sv_call_by="p", p_cutoff=.05, fdr_cutoff=.05,
+    a_layer="A", g_layer="G", spatial_coords=None, store_key="sv_atoi", verbose=True,
+    n_knots=0, knot_candidates=(0, 1, 2, 3, 4, 5, 6),
+):
+    """Jointly model each site's G|(A+G) across covered spots using binomial counts.
+
+    H0: logit(p)=intercept; H1: logit(p)=intercept+x+y. Coordinates are scaled
+    and orthogonalized without changing the linear model. The likelihood-ratio
+    chi-square degrees of freedom equal the observed spatial design rank (normally
+    2 with K=0). n_knots=integer adds K Gaussian RBFs to x/y; n_knots='auto'
+    selects ONE K for this dataset by summed BIC on the common set of sites
+    successfully fitted for every candidate. All candidates use identical spots
+    per site. Auto-mode p values condition on selected K, without selection
+    calibration. Centers use deterministic farthest-point sampling of coordinate
+    support; width is median inter-center distance (.5 for a single center), on
+    scaled coordinates. Rank-deficient columns are removed before fitting.
+    Zero coverage and missing coordinates are excluded. A=0 or G=0 observations
+    remain valid when coverage passes. Require >=3 spots per fitted parameter.
+    BH includes QC-passing failed fits as p=1; their displayed p/FDR remain NaN.
+    Calls use raw p by default, or BH when sv_call_by='fdr'. Both are returned.
+    Inference assumes binomial variance and conditionally independent spots.
+    """
+    if sv_call_by not in {"p","fdr"}:
+        raise ValueError("sv_call_by must be 'p' or 'fdr'")
+    if not 0<p_cutoff<1 or not 0<fdr_cutoff<1:
+        raise ValueError("p_cutoff and fdr_cutoff must be between 0 and 1")
+    if min_cov<1 or min_valid_spots<3 or min_total_A<0 or min_total_G<0:
+        raise ValueError("Invalid count/spot QC thresholds")
+    if isinstance(n_knots,str) and n_knots=='auto':
+        candidates = list(knot_candidates)
+        if not candidates or any(not isinstance(k,(int,np.integer)) or k<0 for k in candidates):
+            raise ValueError('knot_candidates must be nonempty nonnegative integers')
+        return _select_common_k(adata_ai,sorted(set(int(k) for k in candidates)),store_key,verbose,
+            dict(min_cov=min_cov,min_valid_spots=min_valid_spots,min_total_A=min_total_A,
+                min_total_G=min_total_G,sv_call_by=sv_call_by,p_cutoff=p_cutoff,fdr_cutoff=fdr_cutoff,
+                a_layer=a_layer,g_layer=g_layer,spatial_coords=spatial_coords))
+    if not isinstance(n_knots,(int,np.integer)) or n_knots<0:
+        raise ValueError("n_knots must be a nonnegative integer or 'auto'")
+    coords = _coords_from_adata(adata_ai) if spatial_coords is None else np.asarray(spatial_coords,float)
+    if coords.shape != (adata_ai.n_obs,2):
+        raise ValueError("Spatial coordinates must have shape (n_spots,2)")
+    finite = np.isfinite(coords).all(axis=1)
+    matrices=[]
+    for name in (a_layer,g_layer):
+        if name not in adata_ai.layers:
+            raise ValueError("Missing count layer: "+name)
+        m=adata_ai.layers[name]
+        values=m.data if sparse.issparse(m) else np.asarray(m)
+        if not np.isfinite(values).all() or np.any(values<0) or not np.allclose(values,np.round(values),rtol=0,atol=1e-8):
+            raise ValueError("Count layers must contain finite nonnegative integers")
+        matrices.append(m.tocsc() if sparse.issparse(m) else np.asarray(m))
+    rows=[]
+    for j,site in enumerate(adata_ai.var_names):
+        a,g=[np.asarray(m[:,j].toarray() if sparse.issparse(m) else m[:,j],float).ravel() for m in matrices]
+        n=a+g; valid=finite & (n>=min_cov)
+        av,gv,nv=a[valid],g[valid],n[valid]
+        ratio=gv/nv
+        row=dict(site=str(site),gene=adata_ai.var.iloc[j].get("Gene.refGene",""),
+                 n_valid_spots=len(nv),total_A_valid=float(av.sum()),total_G_valid=float(gv.sum()),
+                 total_cov_valid=float(nv.sum()),mean_ratio=float(ratio.mean()) if len(nv) else np.nan,
+                 sd_ratio=float(ratio.std()) if len(nv) else np.nan,pass_qc=False,fit_status="insufficient_counts",
+                 spatial_df=np.nan,spatial_lrt=np.nan,spatial_p=np.nan,spatial_effect=np.nan,
+                 null_probability=np.nan,pearson_dispersion=np.nan,loglik_null=np.nan,loglik_spatial=np.nan)
+        if len(nv)>=min_valid_spots and av.sum()>=min_total_A and gv.sum()>=min_total_G and av.sum()>0 and gv.sum()>0:
+            x=_linear_design(coords[valid],n_knots,coords[finite]); df=x.shape[1]-1
+            row["spatial_df"]=df
+            if df==0:
+                row["fit_status"]="no_spatial_variation"
+            elif len(nv)<3*x.shape[1]:
+                row["fit_status"]="insufficient_spots_for_model"
+            else:
+                row["pass_qc"]=True
+                try:
+                    p0=gv.sum()/nv.sum()
+                    ll0=float(np.sum(gammaln(nv+1)-gammaln(gv+1)-gammaln(nv-gv+1)+gv*np.log(p0)+(nv-gv)*np.log1p(-p0)))
+                    ll1,p1=_fit_binomial(gv,nv,x)
+                    if ll1<ll0-1e-5:
+                        raise RuntimeError("alternative likelihood below null")
+                    statistic=max(0.,2*(ll1-ll0))
+                    row.update(fit_status="ok",spatial_lrt=statistic,spatial_p=float(chi2.sf(statistic,df)),
+                               spatial_effect=float(np.quantile(p1,.95)-np.quantile(p1,.05)),
+                               null_probability=float(p0),loglik_null=ll0,loglik_spatial=ll1,
+                               pearson_dispersion=float(np.sum((gv-nv*p1)**2/np.maximum(nv*p1*(1-p1),1e-12))/(len(nv)-x.shape[1])))
+                except (RuntimeError,ValueError,np.linalg.LinAlgError) as exc:
+                    row["fit_status"]="fit_failed: "+str(exc)
+        rows.append(row)
+        if verbose and (j+1)%100==0:
+            print("Linear binomial: {}/{} sites".format(j+1,adata_ai.n_vars))
+    columns=["site","gene","n_valid_spots","total_A_valid","total_G_valid","total_cov_valid",
+             "mean_ratio","sd_ratio","pass_qc","fit_status","spatial_df","spatial_lrt","spatial_p",
+             "spatial_effect","null_probability","pearson_dispersion","loglik_null","loglik_spatial"]
+    result=pd.DataFrame(rows,columns=columns)
+    result["pass_qc"]=result.pass_qc.astype(bool)
+    result["spatial_fdr"]=np.nan
+    qc=result.pass_qc
+    if qc.any():
+        result.loc[qc,"spatial_fdr"]=multipletests(result.loc[qc,"spatial_p"].fillna(1),method="fdr_bh")[1]
+        result.loc[result.spatial_p.isna(),"spatial_fdr"]=np.nan
+    col="spatial_p" if sv_call_by=="p" else "spatial_fdr"
+    cutoff=p_cutoff if sv_call_by=="p" else fdr_cutoff
+    result["is_sv_atoi"]=qc & result[col].lt(cutoff)
+    result["sv_call_by"]=col
+    result["p_cutoff"]=p_cutoff
+    result["fdr_cutoff"]=fdr_cutoff
+    result["model_family"]="binomial"
+    result["selected_n_knots"]=int(n_knots)
+    result["p_method"]="asymptotic_chi2"
+    result=result.sort_values(["spatial_p","spatial_effect"],ascending=[True,False]).reset_index(drop=True)
+    # Remove stale auxiliary results from earlier, more complex implementations.
+    for suffix in ("_k_selection","_k_selection_sites","_family_diagnostics","_family_diagnostics_config"):
+        adata_ai.uns.pop(store_key+suffix,None)
+    adata_ai.uns[store_key]=result
+    adata_ai.uns[store_key+"_model_config"]=dict(family="binomial",null="logit(p)=intercept",
+        alternative="logit(p)=intercept+x+y+Gaussian_RBFs" if n_knots else "logit(p)=intercept+x+y",
+        n_knots=int(n_knots), selected_n_knots=int(n_knots),test="asymptotic likelihood-ratio chi-square",
+        min_cov=min_cov,min_valid_spots=min_valid_spots,min_total_A=min_total_A,min_total_G=min_total_G,
+        a_layer=a_layer,g_layer=g_layer,sv_call_by=col,p_cutoff=p_cutoff,fdr_cutoff=fdr_cutoff)
+    if verbose:
+        print("Linear binomial: {} fitted, {} called ({} < {})".format(int(result.fit_status.eq("ok").sum()),int(result.is_sv_atoi.sum()),col,cutoff))
+    return result
+
+
+def plot_count_spatial_discovery(sv_atoi, figsize=(5, 4)):
+    """Plot only all/QC pass/SV counts; use the supplied is_sv_atoi calls."""
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=figsize)
+    counts = [len(sv_atoi), int(sv_atoi.pass_qc.sum()), int(sv_atoi.is_sv_atoi.sum())]
+    bars = ax.bar(["all", "QC pass", "SV"], counts,
+                  color=["#bdbdbd", "#f28e2b", "#59a14f"])
+    ax.set(ylabel="Site count", title="Count-model discovery")
+    ax.set_ylim(0, max(1, max(counts))*1.15)
+    for bar, value in zip(bars, counts):
+        ax.annotate(str(value), (bar.get_x()+bar.get_width()/2, value),
+                    xytext=(0, 4), textcoords="offset points", ha="center", va="bottom")
+    fig.tight_layout()
+    return fig, ax
+
+
+def validate_counts(d):
+    a = d[['edited', 'unedited']].to_numpy(float)
+    if not np.isfinite(a).all() or (a < 0).any() or not np.allclose(a, np.round(a)):
+        raise ValueError('edited/unedited must be finite, nonnegative integer counts')
+    if d.index.has_duplicates:
+        raise ValueError('Duplicate spot identifiers')
+    return d.assign(total=a.sum(axis=1))
+
+
+def matrix_counts(adata, site):
+    """Existing workflow convention: G=edited, A=unedited; strand unverified."""
+    if not adata.var_names.is_unique:
+        raise ValueError('Duplicate site IDs')
+    j = adata.var_names.get_loc(site)
+    def column(name):
+        x = adata.layers[name][:, j]
+        return np.asarray(x.toarray() if hasattr(x, 'toarray') else x).ravel()
+    return validate_counts(pd.DataFrame({'edited': column('G'), 'unedited': column('A')},
+                                       index=adata.obs_names))
+
+
+def overlap_resource(path, chrom, pos1, kind='bed'):
+    """BED is 0-based half-open; GTF is 1-based inclusive. Exact contig names."""
+    if not path or not Path(path).is_file():
+        return 'pending', ''
+    opener = gzip.open if str(path).endswith('.gz') else open
+    hits = set()
+    seen_contig = False
+    with opener(path, 'rt') as stream:
+        for line in stream:
+            if line.startswith(('#', 'track', 'browser')) or not line.strip():
+                continue
+            f = line.rstrip().split('\t')
+            if f[0] != chrom:
+                continue
+            seen_contig = True
+            if kind == 'gtf':
+                if len(f) < 9 or f[2] != 'gene':
+                    continue
+                if int(f[3]) <= pos1 <= int(f[4]):
+                    hits.add(f[8] + '; strand=' + f[6])
+            elif int(f[1]) <= pos1 - 1 < int(f[2]):
+                hits.add('|'.join(f[3:6]) if len(f) > 3 else f'{f[0]}:{f[1]}-{f[2]}')
+    return ('queried' if seen_contig else 'contig_absent_or_empty_resource'), '; '.join(sorted(hits))
+
+
+def audit_site(site, spec=None, resources=None):
+    spec, resources = spec or {}, resources or {}
+    row = dict(site=site, build=spec.get('build', 'pending'),
+               coordinate_convention=spec.get('coordinate_convention', 'pending'),
+               strand=spec.get('strand', 'pending'), reference_base='pending',
+               reference_check='pending', bam_support='pending',
+               independent_molecules='pending', audit_class='computational_reliability')
+    if not all(k in spec for k in ('chrom', 'pos1', 'build', 'strand')):
+        row.update(gene_status='pending', homolog_status='pending')
+        return row
+    chrom, pos = spec['chrom'], int(spec['pos1'])
+    if pos < 1 or spec['strand'] not in ('+', '-'):
+        raise ValueError('Explicit positive 1-based coordinate and +/- strand required')
+    row.update(chrom=chrom, pos1=pos)
+    for name, kind in [('gene', 'gtf'), ('homolog', 'bed')]:
+        if resources.get(name + '_build') != spec['build']:
+            status, hits = 'pending_build_match', ''
+        else:
+            status, hits = overlap_resource(resources.get(name), chrom, pos, kind)
+        row[name + '_status'], row[name + '_overlaps'] = status, hits
+    if resources.get('fasta') and resources.get('fasta_build') == spec['build']:
+        import pysam
+        with pysam.FastaFile(str(resources['fasta'])) as fa:
+            base = fa.fetch(chrom, pos - 1, pos).upper()
+        row['reference_base'] = base
+        row['reference_check'] = 'match' if base == ('A' if spec['strand'] == '+' else 'T') else 'MISMATCH'
+    return row
+
+
+def bam_counts(bam_path, spec, spots, profile, unit='read'):
+    """Count once per query-name or (CB,UB) at a site; discard conflicting bases.
+
+    Requires indexed coordinate-sorted BAM and verified genomic strand/base.
+    NH=1 is required in unique profiles; absent NH is not evidence of uniqueness.
+    UMI mode excludes reads without UB, and is a separate counting unit.
+    Duplicate-flagged reads are excluded in read mode, retained for UMI consensus.
+    Quality metrics describe passing alignments, not independent observations.
+    """
+    import pysam
+    if unit not in ('read', 'umi'):
+        raise ValueError('unit must be read or umi')
+    ref, alt = ('A', 'G') if spec['strand'] == '+' else ('T', 'C')
+    groups, metrics = {}, []
+    excluded = dict(missing_CB=0, missing_UB=0, missing_NH=0)
+    spots = pd.Index(spots)
+    allowed = set(spots)
+    pos0 = int(spec['pos1']) - 1
+    with pysam.AlignmentFile(str(bam_path), 'rb') as bam:
+        for r in bam.fetch(spec['chrom'], pos0, pos0 + 1):
+            if r.is_unmapped or r.is_secondary or r.is_supplementary or r.is_qcfail:
+                continue
+            if unit == 'read' and r.is_duplicate:
+                continue
+            if r.mapping_quality == 255 or r.mapping_quality < profile['mapq']:
+                continue
+            if profile['unique']:
+                if not r.has_tag('NH'):
+                    excluded['missing_NH'] += 1
+                    continue
+                if r.get_tag('NH') != 1:
+                    continue
+            if not r.has_tag('CB'):
+                excluded['missing_CB'] += 1
+                continue
+            cb = r.get_tag('CB')
+            if cb not in allowed:
+                continue
+            if unit == 'umi' and not r.has_tag('UB'):
+                excluded['missing_UB'] += 1
+                continue
+            for q, p in r.get_aligned_pairs(matches_only=True):
+                if p != pos0:
+                    continue
+                if r.query_qualities is None or r.query_sequence is None:
+                    break
+                bq = r.query_qualities[q]
+                end = min(q, r.query_length - 1 - q)
+                if bq < profile['baseq'] or end < profile['end_distance']:
+                    break
+                base = r.query_sequence[q].upper()
+                key = (cb, r.get_tag('UB') if unit == 'umi' else r.query_name)
+                groups.setdefault(key, set()).add(base)
+                metrics.append((base, bq, r.mapping_quality, end, r.is_reverse))
+                break
+    counts = pd.DataFrame(0, index=spots, columns=['edited', 'unedited'])
+    conflicts = other = 0
+    for (cb, _), bases in groups.items():
+        if len(bases) != 1:
+            conflicts += 1
+            continue
+        base = next(iter(bases))
+        if base in (ref, alt):
+            counts.loc[cb, 'edited' if base == alt else 'unedited'] += 1
+        else:
+            other += 1
+    info = dict(unit=unit, conflict_units=conflicts, other_base_units=other, **excluded)
+    for label, base in [('edited', alt), ('unedited', ref)]:
+        values = np.array([m[1:] for m in metrics if m[0] == base], dtype=float)
+        info[label + '_passing_alignments'] = len(values)
+        for j, name in enumerate(['baseq', 'mapq', 'end_distance', 'reverse_fraction']):
+            info[label + '_' + name] = float(values[:, j].mean()) if len(values) else np.nan
+    return validate_counts(counts), info
+
+
+def prepare_spots(counts, obs, composition, celltypes, group_key='ground_truth',
+                  xy=('x_array', 'y_array'), wm_pattern=r'(?:^WM$|white)'):
+    if obs.index.has_duplicates or composition.index.has_duplicates:
+        raise ValueError('Duplicate metadata/composition spot IDs')
+    d = validate_counts(counts).join(obs[[group_key, *xy]], how='left')
+    d['wm'] = d[group_key].astype('string').str.contains(wm_pattern, case=False, regex=True).astype(float)
+    p = composition.reindex(d.index)[list(celltypes)].apply(pd.to_numeric, errors='coerce')
+    if (p < 0).any().any():
+        raise ValueError('Negative composition entries')
+    p = p.div(p.sum(axis=1, min_count=len(celltypes)).replace(0, np.nan), axis=0)
+    d = d.join(p.add_prefix('ct:'))
+    return d.rename(columns={xy[0]: 'x', xy[1]: 'y'})
+
+
+def _design(d, cols):
+    x = pd.DataFrame({'intercept': 1., 'wm': d.wm}, index=d.index)
+    for c in cols:
+        values = np.log1p(d.total) if c == 'log_coverage' else d[c]
+        sd = values.std()
+        if not np.isfinite(sd) or sd < 1e-10:
+            raise ValueError('constant_covariate:' + c)
+        x[c] = (values - values.mean()) / sd
+    if np.linalg.matrix_rank(x) < x.shape[1]:
+        raise ValueError('rank_deficient')
+    condition = float(np.linalg.cond(x))
+    if condition > 1000:
+        raise ValueError('ill_conditioned')
+    if len(cols):
+        z = x.drop(columns='wm').to_numpy()
+        resid = d.wm.to_numpy() - z @ np.linalg.lstsq(z, d.wm, rcond=None)[0]
+        r2 = 1 - (resid @ resid) / ((d.wm - d.wm.mean()) ** 2).sum()
+    else:
+        r2 = 0.
+    return x, condition, float(r2)
+
+
+def _fit(y, x, target):
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        fit = sm.GLM(y, x, family=sm.families.Binomial()).fit(maxiter=100)
+    if not fit.converged or not np.isfinite(fit.params).all() or np.max(np.abs(fit.params)) > 25:
+        raise ValueError('nonconvergence_or_separation')
+    x0, x1 = target.copy(), target.copy()
+    x0['wm'], x1['wm'] = 0., 1.
+    rd = float(np.mean(fit.predict(x1) - fit.predict(x0)))
+    return rd, float(fit.params['wm']), float(fit.pearson_chi2 / fit.df_resid)
+
+
+def analyze_condition(d, min_cov=5, reference_celltype=None, block_size=8,
+                      n_boot=499, seed=20260906, min_spots=None, min_blocks=10):
+    """Grouped binomial quasi-likelihood mean + pairs spatial block bootstrap.
+
+    Same complete-case spots for every model. K-1 normalized fractions;
+    prespecified reference is required. Intervals use jointly successful draws.
+    Blocks resample entire local neighborhoods; they are NOT biological replicates.
+    """
+    if n_boot < 20 or block_size <= 0:
+        raise ValueError('Need n_boot >=20 and positive block_size')
+    ct = [c for c in d if c.startswith('ct:')]
+    reference = 'ct:' + str(reference_celltype)
+    if reference not in ct:
+        raise ValueError('Specify an existing reference_celltype')
+    ct = [c for c in ct if c != reference]
+    eligible = d.loc[d.wm.notna()]
+    coverage = {}
+    for wm, label in [(1, 'wm'), (0, 'nonwm')]:
+        g = eligible.loc[eligible.wm == wm]
+        measured = g.loc[g.total >= min_cov]
+        coverage.update({label + '_all_spots': len(g), label + '_measurable_spots': len(measured),
+                         label + '_total_counts': measured.total.sum(),
+                         label + '_edited_counts': measured.edited.sum(),
+                         label + '_median_coverage_all': g.total.median()})
+    d = eligible.loc[eligible.total >= min_cov].dropna(
+        subset=['x', 'y', *[c for c in d if c.startswith('ct:')]]).copy()
+    if not np.isfinite(d[['x', 'y']].to_numpy()).all():
+        raise ValueError('Nonfinite spatial coordinates')
+    for wm, label in [(1, 'wm'), (0, 'nonwm')]:
+        g = d.loc[d.wm == wm]
+        coverage[label + '_model_spots'] = len(g)
+        coverage[label + '_model_total_counts'] = g.total.sum()
+    raw = []
+    for wm in (1, 0):
+        g = eligible.loc[(eligible.wm == wm) & (eligible.total >= min_cov)]
+        raw.append(g.edited.sum() / g.total.sum() if g.total.sum() else np.nan)
+    coverage['pooled_rate_difference_all_measurable'] = raw[0] - raw[1]
+    models = {'unadjusted': [], 'composition': ct, 'composition_coverage': ct + ['log_coverage']}
+    rows, designs = [], {}
+    blocks = np.floor(d[['x', 'y']].to_numpy(float) / block_size).astype(int)
+    block_ids = np.array([f'{a}:{b}' for a, b in blocks])
+    unique = np.unique(block_ids)
+    wm_blocks = len(np.unique(block_ids[d.wm.to_numpy() == 1]))
+    nonwm_blocks = len(np.unique(block_ids[d.wm.to_numpy() == 0]))
+    y = d[['edited', 'unedited']].to_numpy()
+    for model, cols in models.items():
+        row = dict(model=model, status='ok', rate_difference=np.nan, ci_low=np.nan,
+                   ci_high=np.nan, n_spots=len(d), n_blocks=len(unique),
+                   wm_blocks=wm_blocks, nonwm_blocks=nonwm_blocks, **coverage)
+        try:
+            if min((d.wm == 0).sum(), (d.wm == 1).sum()) == 0:
+                raise ValueError('missing_region_observations')
+            if min_spots is not None and min((d.wm == 0).sum(), (d.wm == 1).sum()) < min_spots:
+                raise ValueError('insufficient_spots')
+            if len(d) <= len(cols) + 2:
+                raise ValueError('insufficient_residual_df')
+            x, cond, r2 = _design(d, cols)
+            rd, beta, dispersion = _fit(y, x, x)
+            row.update(rate_difference=rd, log_odds_ratio=beta, dispersion=dispersion,
+                       condition_number=cond, wm_explained_R2=r2,
+                       composition_overlap_warning=bool(r2 > .95))
+            designs[model] = x
+            if len(unique) < min_blocks:
+                row['status'] = 'point_only_insufficient_spatial_blocks'
+            if min(wm_blocks, nonwm_blocks) < 2:
+                row['status'] = 'point_only_single_region_block'
+        except (ValueError, np.linalg.LinAlgError, Warning) as exc:
+            row['status'] = str(exc)
+        rows.append(row)
+    draws = {m: [] for m in designs}
+    if len(unique) >= min_blocks and designs:
+        rng = np.random.default_rng(seed)
+        members = {b: np.flatnonzero(block_ids == b) for b in unique}
+        for _ in range(n_boot):
+            ix = np.concatenate([members[b] for b in rng.choice(unique, len(unique), replace=True)])
+            values = {}
+            try:
+                for model, x in designs.items():
+                    xb = x.iloc[ix]
+                    if np.linalg.matrix_rank(xb) < xb.shape[1]:
+                        raise ValueError('bootstrap_rank')
+                    values[model] = _fit(y[ix], xb, xb)[0]
+            except (ValueError, np.linalg.LinAlgError, Warning):
+                continue
+            for model, value in values.items():
+                draws[model].append(value)
+    for row in rows:
+        values = draws.get(row['model'], [])
+        if row['model'] != 'unadjusted':
+            row['adjustment_change'] = row['rate_difference'] - rows[0]['rate_difference']
+        row['bootstrap_success'] = len(values)
+        row['bootstrap_requested'] = n_boot
+        if row['status'] == 'ok':
+            if len(values) >= max(20, .8 * n_boot):
+                row['ci_low'], row['ci_high'] = np.quantile(values, [.025, .975])
+            else:
+                row['status'] = 'point_only_bootstrap_unstable'
+        if row['model'] != 'unadjusted' and len(values) and len(values) == len(draws.get('unadjusted', [])):
+            change = np.asarray(values) - np.asarray(draws['unadjusted'])
+            row['adjustment_change'] = row['rate_difference'] - rows[0]['rate_difference']
+            if row['status'] == 'ok':
+                row['change_ci_low'], row['change_ci_high'] = np.quantile(change, [.025, .975])
+    return pd.DataFrame(rows)
+
+
+def plot_results(results, output_dir):
+    """Gap + NE annotation for unestimable effects; counts retained underneath."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sites = list(results.site.unique())
+    fig, axes = plt.subplots(2, len(sites), figsize=(7 * len(sites), 7), squeeze=False)
+    for j, site in enumerate(sites):
+        s = results.loc[(results.site == site) & (results.model == 'unadjusted') & (results.block_role == 'primary')]
+        available_conditions = s.loc[s.status != 'pending_input', 'condition'].unique()
+        if len(available_conditions):
+            s = s.loc[s.condition.isin(available_conditions)]
+        conditions = list(s.condition.unique())
+        for sample, sub in s.groupby('sample_id', sort=False):
+            sub = sub.set_index('condition').reindex(conditions)
+            xx = np.arange(len(conditions))
+            line, = axes[0, j].plot(xx, sub.rate_difference, 'o-', label=sample)
+            valid_ci = np.isfinite(sub.ci_low) & np.isfinite(sub.ci_high)
+            axes[0, j].vlines(xx[valid_ci], sub.ci_low[valid_ci], sub.ci_high[valid_ci], color=line.get_color())
+            for k, value in enumerate(sub.rate_difference):
+                if not np.isfinite(value):
+                    pooled = sub.iloc[k].get('pooled_rate_difference_all_measurable', np.nan)
+                    if np.isfinite(pooled):
+                        axes[0, j].plot(k, pooled, 'o', markerfacecolor='none', color=line.get_color())
+                    else:
+                        axes[0, j].text(k, .02, 'NE', transform=axes[0, j].get_xaxis_transform(), fontsize=8)
+            axes[1, j].plot(xx, sub.wm_model_spots, 'o-', color=line.get_color(), label=f'{sample} WM')
+            axes[1, j].plot(xx, sub.nonwm_model_spots, 's--', color=line.get_color(), label=f'{sample} non-WM')
+        for ax in axes[:, j]:
+            ax.set_xticks(range(len(conditions)))
+            ax.set_xticklabels(conditions, rotation=65, ha='right')
+            ax.legend(fontsize=7)
+        axes[0, j].axhline(0, color='grey', lw=.8)
+        axes[0, j].set_title(site)
+        axes[0, j].set_ylabel('WM - non-WM editing probability')
+        axes[1, j].set_ylabel('Effective spots (same complete-case set)')
+    fig.suptitle('Hollow points: descriptive pooled difference only; inference unavailable.\n'
+                 'Missing BAM/quality inputs are pending in the table, excluded from axes.', fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, .93))
+    fig.savefig(output_dir / 'core_site_robustness.pdf', bbox_inches='tight')
+    fig.savefig(output_dir / 'core_site_robustness.png', dpi=160, bbox_inches='tight')
+    fig2, axes2 = plt.subplots(1, len(sites), figsize=(7 * len(sites), 5), squeeze=False)
+    for j, site in enumerate(sites):
+        s = results.loc[(results.site == site) & (results.block_role == 'primary') & (results.condition == 'matrix_cov5')]
+        ax = axes2[0, j]
+        for k, (_, r) in enumerate(s.iterrows()):
+            color = {'unadjusted': '#3579b1', 'composition': '#d77a28',
+                     'composition_coverage': '#38946a'}.get(r.model, 'grey')
+            if np.isfinite(r.rate_difference):
+                ax.plot(r.rate_difference, k, 'o', color=color)
+                if np.isfinite(r.ci_low) and np.isfinite(r.ci_high):
+                    ax.hlines(k, r.ci_low, r.ci_high, color=color)
+            else:
+                ax.text(.05, k, 'NE: ' + str(r.status), fontsize=8,
+                        transform=ax.get_yaxis_transform(), va='center')
+        ax.set_ylim(-.6, max(len(s)-.4, .6))
+        ax.set_yticks(range(len(s)))
+        ax.set_yticklabels([f'{r.sample_id}: {r.model}' +
+                           (' *' if str(r.status).startswith('point_only') else '')
+                           for _, r in s.iterrows()])
+        if np.isfinite(s.rate_difference).any():
+            ax.axvline(0, color='grey', lw=.8)
+        else:
+            ax.set_xticks([])
+        ax.set_title(site)
+        ax.set_xlabel('WM - non-WM editing probability (95% block bootstrap CI)')
+    fig2.suptitle('* Point estimate only: spatial uncertainty not reliably estimable.\n'
+                  'See effect table for fit diagnostics and bootstrap success counts.', fontsize=10)
+    fig2.tight_layout(rect=(0, 0, 1, .90))
+    fig2.savefig(output_dir / 'core_site_composition_effect.pdf', bbox_inches='tight')
+    fig2.savefig(output_dir / 'core_site_composition_effect.png', dpi=160, bbox_inches='tight')
+    return fig, fig2
+
+
+def run_core_analysis(data_root, sample_ids, sites, parse_celltype, output_dir,
+                      reference_celltype='Inhib', coverages=(5, 10, 20),
+                      block_sizes=(8, 12), n_boot=499, site_specs=None,
+                      resources=None, bam_paths=None, bam_builds=None, units=('read', 'umi')):
+    """Reload unfiltered matrices; optional BAM counts never replace matrix silently."""
+    import anndata as ad
+    import json
+    site_specs, resources = site_specs or {}, resources or {}
+    bam_paths, bam_builds = bam_paths or {}, bam_builds or {}
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records, audits, support = [], [], []
+    for sample in sample_ids:
+        print('Core audit:', sample, flush=True)
+        base = Path(data_root) / str(sample)
+        a = ad.read_h5ad(base / 'adata_ai.h5ad')
+        deconv = pd.read_csv(base / 'adata_obs_SPARROW.csv', index_col=0)
+        labels = pd.read_csv(base / f'cluster_labels_{sample}.csv')
+        labels.index = labels['key'].str.split('_', n=1).str[1]
+        if labels.index.has_duplicates:
+            raise ValueError('Duplicate label barcodes')
+        positions = pd.read_csv(base / 'spatial/tissue_positions_list.csv', header=None,
+                                names=['barcode', 'in_tissue', 'x_array', 'y_array', 'x_pixel', 'y_pixel']).set_index('barcode')
+        obs = positions.join(labels[['ground_truth']], how='left').reindex(a.obs_names)
+        # Use measured tissue spots only; unknown anatomical labels remain missing.
+        obs.loc[obs.in_tissue != 1, 'ground_truth'] = np.nan
+        obs['ground_truth'] = obs.ground_truth.replace(['nan', 'None', 'NA', 'null', ''], np.nan)
+        rawcols = [c for c in deconv if c.startswith(('Ex_', 'Inhib', 'Astro', 'Oligo', 'OPC', 'Micro', 'Macro', 'Endo', 'Mix'))]
+        if not rawcols:
+            raise ValueError('No recognized SPARROW cell types; configure explicit mapping')
+        p = pd.DataFrame(index=deconv.index)
+        for c in rawcols:
+            group = parse_celltype(c)
+            if group not in p:
+                p[group] = 0.
+            p[group] = p[group] + pd.to_numeric(deconv[c], errors='raise')
+        p.to_csv(output_dir / f'{sample}_composition_input.tsv', sep='\t')
+        for site in sites:
+            spec = site_specs.get(site, {})
+            audit = audit_site(site, spec, resources)
+            audit.update(sample_id=str(sample), matrix_present=site in a.var_names,
+                         matrix_count_convention='G edited / A unedited; upstream strand handling must be audited',
+                         matrix_count_unit='unknown_until_upstream_provenance_checked')
+            sources = {}
+            if site in a.var_names:
+                sources['matrix'] = matrix_counts(a, site)
+                for key, value in a.var.loc[site].items():
+                    if str(key).startswith(('Gene.', 'Func.', 'ExonicFunc.')) or key in (
+                        'chr', 'pos', 'Region', 'Position', 'Ref', 'Ed', 'Strand',
+                        'Accession', 'db', 'type', 'dbsnp', 'repeat', 'geneID', 'geneType', 'geneTag'):
+                        audit['upstream_' + str(key)] = value
+            else:
+                support.append(dict(sample_id=str(sample), site=site, source='matrix', status='site_absent'))
+            bam = bam_paths.get(str(sample))
+            if bam and audit['reference_check'] == 'match' and bam_builds.get(str(sample)) == spec.get('build'):
+                for unit in units:
+                    for name, profile in QUALITY_PROFILES.items():
+                        counts, info = bam_counts(bam, spec, a.obs_names, profile, unit)
+                        source = f'{unit}_{name}'
+                        sources[source] = counts
+                        support.append(dict(sample_id=str(sample), site=site, source=source, status='counted', **info))
+                audit['bam_support'] = 'counted; inspect support and bias metrics'
+                if 'umi' in units:
+                    audit['independent_molecules'] = 'CB+UB consensus attempted; inspect missing_UB and support'
+            else:
+                support.append(dict(sample_id=str(sample), site=site, source='bam',
+                                    status='pending_BAM_verified_reference_and_build'))
+            audits.append(audit)
+            # Missing BAM profiles remain visible as pending rows, not fabricated zero effects.
+            pending_sources = [f'{u}_{q}' for u in units for q in QUALITY_PROFILES if f'{u}_{q}' not in sources]
+            if 'matrix' not in sources:
+                pending_sources.insert(0, 'matrix')
+            for source in pending_sources:
+                for cov in coverages:
+                    for model in ('unadjusted', 'composition', 'composition_coverage'):
+                        records.append(dict(sample_id=str(sample), site=site, condition=f'{source}_cov{cov}',
+                                            source=source, min_cov=cov, block_size=block_sizes[0], block_role='primary',
+                                            model=model, status='pending_input', rate_difference=np.nan,
+                                            ci_low=np.nan, ci_high=np.nan, wm_model_spots=np.nan, nonwm_model_spots=np.nan))
+            for source, counts in sources.items():
+                d = prepare_spots(counts, obs, p, list(p.columns))
+                for cov in coverages:
+                    for ib, block in enumerate(block_sizes):
+                        result = analyze_condition(d, cov, reference_celltype, block, n_boot)
+                        result = result.assign(sample_id=str(sample), site=site, source=source,
+                                               condition=f'{source}_cov{cov}', min_cov=cov, block_size=block,
+                                               block_role='primary' if ib == 0 else 'sensitivity')
+                        records.extend(result.to_dict('records'))
+        del a
+    result, audit_df = pd.DataFrame(records), pd.DataFrame(audits)
+    result.to_csv(output_dir / 'core_site_effects.tsv', sep='\t', index=False)
+    audit_df.to_csv(output_dir / 'core_site_audit.tsv', sep='\t', index=False)
+    pd.DataFrame(support).to_csv(output_dir / 'core_site_read_support.tsv', sep='\t', index=False)
+    supplementary = result.merge(audit_df, on=['sample_id', 'site'], how='left')
+    support_df = pd.DataFrame(support).rename(columns={'status': 'read_support_status'})
+    if not support_df.empty:
+        supplementary = supplementary.merge(support_df, on=['sample_id', 'site', 'source'], how='left')
+    supplementary.to_csv(
+        output_dir / 'Supplementary_core_site_audit_sensitivity.tsv', sep='\t', index=False)
+    config = dict(sample_ids=list(sample_ids), sites=list(sites), reference_celltype=reference_celltype,
+                  coverages=list(coverages), block_sizes=list(block_sizes), n_boot=n_boot, seed=20260906,
+                  site_specs=site_specs, resources=resources, bam_paths=bam_paths, bam_builds=bam_builds,
+                  quality_profiles=QUALITY_PROFILES, units=list(units),
+                  estimand='equal-spot standardized editing probability difference on common complete cases',
+                  inference='within-section spatial block bootstrap; no across-donor inference')
+    config['minimum_spots_per_region'] = None
+    (output_dir / 'core_site_run_config.json').write_text(json.dumps(config, indent=2, default=str), encoding='utf-8')
+    if not result.empty:
+        plot_results(result, output_dir)
+    return result, audit_df
+
+
+def parse_dlpfc_celltype_group(col):
+    """
+    Convert fine DLPFC deconvolution cell type names to analysis-level groups.
+
+    Key rule:
+        Ex_10_L2_4 -> Ex_L2_4
+        Ex_1_L5_6  -> Ex_L5_6
+        Ex_8_L5_6  -> Ex_L5_6
+        Ex_4_L_6   -> Ex_L6
+
+    The number after Ex_ is treated as subtype index and removed.
+    Layer information is retained.
+    """
+    name = str(col)
+
+    # Excitatory neurons: keep layer information
+    if name.startswith("Ex_"):
+        parts = name.split("_")
+
+        # Remove "Ex" and subtype number
+        if len(parts) >= 3 and parts[1].isdigit():
+            rest = parts[2:]
+        else:
+            rest = parts[1:]
+
+        rest = [p for p in rest if p not in ["", " "]]
+        rest = [p.replace("Layer", "L") for p in rest]
+
+        # Ex_4_L_6 -> Ex_L6
+        if len(rest) >= 2 and rest[0] == "L":
+            layer = "L" + "_".join(rest[1:])
+            return "Ex_" + layer
+
+        # Ex_10_L2_4 -> Ex_L2_4
+        if len(rest) >= 1 and rest[0].startswith("L"):
+            return "Ex_" + "_".join(rest)
+
+        return "Ex_unknown_layer"
+
+    if name.startswith("Inhib"):
+        return "Inhib"
+
+    if name.startswith("Astros") or name.startswith("Astro"):
+        return "Astros"
+
+    if name.startswith("Oligos") or name.startswith("Oligo"):
+        return "Oligos"
+
+    if name.startswith("OPCs") or name.startswith("OPC"):
+        return "OPCs"
+
+    if (
+        name.startswith("Micro/Macro")
+        or name.startswith("Micro")
+        or name.startswith("Macro")
+    ):
+        return "Micro/Macro"
+
+    if name.startswith("Endo"):
+        return "Endo"
+
+    if name.startswith("Mix"):
+        return "Mix"
+
+    return name
+
+
+def _figure_export_title(fig):
+    titles = []
+    if getattr(fig, "_suptitle", None) is not None:
+        text = fig._suptitle.get_text().strip()
+        if text:
+            titles.append(text)
+    for ax in fig.axes:
+        text = ax.get_title().strip()
+        if text and text not in titles:
+            titles.append(text)
+    return " - ".join(titles[:2]) or "figure"
+
+
+def _filename_slug(text, max_length=90):
+    text = str(text).replace("R?", "R2").replace("?", "2")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
+    return (text[:max_length].rstrip("._-") or "figure")
+
+
+def install_figure_pdf_export(namespace, output_dir):
+    """Install notebook PDF export, preserving the namespace's current sample scope."""
+    original = namespace.setdefault("_SPARROW_ORIGINAL_PLT_SHOW", plt.show)
+    plt.show = original
+    plt.close("all")
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    run_id = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    namespace.update(PLOT_OUTPUT_DIR=destination, PLOT_RUN_ID=run_id,
+                     PLOT_EXPORT_SCOPE="workflow", PLOT_EXPORT_COUNTER=0,
+                     PLOT_EXPORT_MANIFEST=[])
+    def show_and_export(*args, **kwargs):
+        scope = _filename_slug(namespace.get("PLOT_EXPORT_SCOPE", namespace.get("sample_id", "workflow")))
+        for number in plt.get_fignums():
+            fig = plt.figure(number)
+            if getattr(fig, "_sparrow_pdf_export_run", None) == run_id:
+                continue
+            namespace["PLOT_EXPORT_COUNTER"] += 1
+            count = namespace["PLOT_EXPORT_COUNTER"]
+            title = _figure_export_title(fig)
+            filename = "{}_{}_{scope}_{title}.pdf".format(run_id, str(count).zfill(3),
+                        scope=scope, title=_filename_slug(title))
+            path = destination / filename
+            fig.savefig(path, format="pdf", bbox_inches="tight", dpi=300,
+                        metadata={"Title": title, "Subject": "DLPFC spatial A-to-I analysis"})
+            fig._sparrow_pdf_export_run = run_id
+            namespace["PLOT_EXPORT_MANIFEST"].append(dict(run_id=run_id, figure_index=count,
+                scope=scope, title=title, pdf_path=str(path)))
+            print("Saved editable PDF:", path)
+        if namespace["PLOT_EXPORT_MANIFEST"]:
+            pd.DataFrame(namespace["PLOT_EXPORT_MANIFEST"]).to_csv(
+                destination / (run_id + "_figure_manifest.tsv"), sep="\t", index=False)
+        return original(*args, **kwargs)
+    plt.show = show_and_export
+    print("Automatic editable-PDF export directory:", destination)
+    print("Figure export run ID:", run_id)
