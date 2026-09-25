@@ -1753,6 +1753,7 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     whisker_iqr: float = 1.5,
     display_upper_quantile: float = 0.98,
     display_box_pad_iqr: float = 0.35,
+    min_group_size_for_ylim: int = 4,
     max_points_per_group: Optional[int] = 25,
     random_state: int = 0,
 ):
@@ -1781,7 +1782,10 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
         display_bounds = []
         for _, sub in df.groupby([sample_col, region_col], observed=True):
             values = sub[value_col].dropna().astype(float)
-            if values.empty:
+            # A group represented by only one or two covered spots can contain
+            # a single ratio near 1 and should not determine the display range.
+            # It remains in the statistics/boxplot but is clipped visually.
+            if len(values) < max(1, int(min_group_size_for_ylim)):
                 continue
             q1, q3 = values.quantile([0.25, 0.75])
             iqr = q3 - q1
@@ -1866,6 +1870,11 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     ax.set_xlabel("")
     ax.set_ylabel("editing ratio")
     ax.set_title(title)
+    # Apply the limits last.  Seaborn artists and significance annotations
+    # created above must not be allowed to autoscale the y axis afterwards.
+    if robust_ylim and np.isfinite(y_lower) and np.isfinite(y_upper) and y_upper > y_lower:
+        span = y_upper - y_lower
+        ax.set_ylim(max(0, y_lower - 0.05 * span), min(1, y_upper + 0.16 * span))
     plt.tight_layout()
 
     df["shown_in_stripplot"] = df.index.isin(plot_points.index)
@@ -1887,9 +1896,10 @@ def analyze_three_slice_recurrent_sv_wm(
 ):
     """Test every three-slice recurrent SV-A-to-I site for WM enrichment.
 
-    A candidate is selected only when its two-sided Mann-Whitney raw p value is
-    below ``alpha`` independently in all three slices.  Fisher's combined p is
-    used only to rank candidates that pass that reproducibility requirement.
+    Selection first requires the two-sided Mann-Whitney raw p value to be below
+    ``alpha`` independently in all three slices.  If no site passes that strict
+    rule, the fallback is the lowest Fisher combined p among sites tested in
+    all three slices whose Fisher p is below ``alpha``.
     ``data_root`` may be supplied instead of ``adata_by_sample``; in that case
     ``adata_ai.h5ad`` and ``cluster_labels_<sample>.csv`` are loaded per slice.
     """
@@ -1994,8 +2004,24 @@ def analyze_three_slice_recurrent_sv_wm(
         ["all_three_p_lt_alpha", "fisher_p", "max_p_across_slices"],
         ascending=[False, True, True], na_position="last"
     ).reset_index(drop=True)
-    candidates = site_summary.loc[site_summary["all_three_p_lt_alpha"]]
-    selected_site = None if candidates.empty else str(candidates.iloc[0]["site"])
+    strict_candidates = site_summary.loc[site_summary["all_three_p_lt_alpha"]]
+    fisher_candidates = site_summary.loc[
+        site_summary["n_slices_tested"].eq(3)
+        & site_summary["fisher_p"].lt(float(alpha))
+    ]
+    if not strict_candidates.empty:
+        selected_site = str(strict_candidates.iloc[0]["site"])
+        selection_rule = "all_three_raw_p_lt_alpha"
+    elif not fisher_candidates.empty:
+        selected_site = str(fisher_candidates.iloc[0]["site"])
+        selection_rule = "fisher_p_lt_alpha_fallback"
+    else:
+        selected_site = None
+        selection_rule = "none"
+    site_summary["selected"] = site_summary["site"].eq(selected_site)
+    site_summary["selection_rule"] = np.where(
+        site_summary["selected"], selection_rule, "not_selected"
+    )
 
     ratio_rows = []
     cluster_rows = []
