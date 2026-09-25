@@ -29,6 +29,8 @@ __all__ = ['add_celltype_composition_modules', 'add_gene_expression_to_obs', 'ad
 
 _SPATIAL_IMAGE_CACHE = {}
 
+__all__.append("plot_three_slice_sv_atoi_upset")
+
 _EXTERNAL_GENE_FILTER_CACHE = {}
 
 QUALITY_PROFILES = {
@@ -2839,6 +2841,97 @@ def plot_external_overlap_summary(
     return fig, ax
 
 
+def plot_three_slice_sv_atoi_upset(
+    sv_sites: pd.DataFrame,
+    sample_col: str = "sample_id",
+    site_col: str = "site",
+    is_sv_col: str = "is_sv_atoi",
+    sample_order: Optional[Sequence[str]] = None,
+    figsize=(9.5, 5.8),
+    title="SV-A-to-I site overlap across three slices",
+):
+    """Draw a dependency-free UpSet plot of called sites in three slices."""
+    if sv_sites is None or sv_sites.empty:
+        raise ValueError("sv_sites is empty.")
+    if sample_col not in sv_sites.columns or site_col not in sv_sites.columns:
+        raise ValueError(f"sv_sites must contain {sample_col!r} and {site_col!r}.")
+
+    df = sv_sites.copy()
+    if is_sv_col in df.columns:
+        df = df.loc[df[is_sv_col].fillna(False).astype(bool)].copy()
+    df = df.loc[df[sample_col].notna() & df[site_col].notna(), [sample_col, site_col]]
+    df[sample_col] = df[sample_col].astype(str)
+    df[site_col] = df[site_col].astype(str)
+    df = df.drop_duplicates()
+    samples = (list(map(str, sample_order)) if sample_order is not None
+               else df[sample_col].drop_duplicates().tolist())
+    if len(samples) != 3:
+        raise ValueError(f"Exactly three slices are required; found {len(samples)}: {samples}")
+    unknown = sorted(set(df[sample_col]).difference(samples))
+    if unknown:
+        raise ValueError(f"sample_order omits slices present in the data: {unknown}")
+
+    membership = (df.assign(present=True)
+                  .pivot_table(index=site_col, columns=sample_col, values="present",
+                               aggfunc="any", fill_value=False)
+                  .reindex(columns=samples, fill_value=False).astype(bool))
+    patterns = []
+    for mask in range(1, 1 << len(samples)):
+        flags = tuple(bool(mask & (1 << i)) for i in range(len(samples)))
+        exact = np.ones(len(membership), dtype=bool)
+        for sample, flag in zip(samples, flags):
+            exact &= membership[sample].to_numpy() == flag
+        patterns.append({"membership": flags, "intersection_size": int(exact.sum()),
+                         "sites": membership.index[exact].tolist()})
+    intersections = pd.DataFrame(patterns)
+    intersections = intersections.loc[intersections["intersection_size"] > 0].copy()
+    intersections["degree"] = intersections["membership"].map(sum)
+    intersections = intersections.sort_values(
+        ["intersection_size", "degree"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    fig = plt.figure(figsize=figsize)
+    grid = fig.add_gridspec(2, 2, width_ratios=(1.25, 3.8), height_ratios=(3.2, 1.35),
+                           hspace=0.08, wspace=0.08)
+    ax_sets = fig.add_subplot(grid[1, 0])
+    ax_bars = fig.add_subplot(grid[0, 1])
+    ax_matrix = fig.add_subplot(grid[1, 1], sharex=ax_bars)
+    x = np.arange(len(intersections))
+    sizes = intersections["intersection_size"].to_numpy()
+    ax_bars.bar(x, sizes, color="#4e79a7", width=0.72)
+    for xi, value in zip(x, sizes):
+        ax_bars.text(xi, value, str(value), ha="center", va="bottom", fontsize=8)
+    ax_bars.set_ylabel("Intersection size")
+    ax_bars.set_title(title)
+    ax_bars.tick_params(axis="x", bottom=False, labelbottom=False)
+
+    for xi, flags in zip(x, intersections["membership"]):
+        active = [i for i, flag in enumerate(flags) if flag]
+        if len(active) > 1:
+            ax_matrix.plot([xi, xi], [min(active), max(active)], color="#333333", lw=1.5)
+        for yi, flag in enumerate(flags):
+            ax_matrix.scatter(xi, yi, s=42,
+                              color="#333333" if flag else "#d9d9d9", zorder=3)
+    ax_matrix.set_yticks(range(3), labels=samples)
+    ax_matrix.set_ylim(2.55, -0.55)
+    ax_matrix.set_xlabel("Exclusive intersections")
+    ax_matrix.spines[["top", "right", "bottom"]].set_visible(False)
+    ax_matrix.tick_params(axis="x", bottom=False, labelbottom=False)
+
+    set_sizes = membership.sum(axis=0).reindex(samples)
+    ax_sets.barh(range(3), set_sizes.to_numpy(), color="#59a14f", height=0.6)
+    for yi, value in enumerate(set_sizes):
+        ax_sets.text(value, yi, f" {int(value)}", va="center", fontsize=8)
+    ax_sets.set_yticks(range(3), labels=samples)
+    ax_sets.set_ylim(2.55, -0.55)
+    ax_sets.invert_xaxis()
+    ax_sets.set_xlabel("Set size")
+    ax_sets.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    axes = {"set_size": ax_sets, "intersection": ax_bars, "matrix": ax_matrix}
+    return fig, axes, intersections
+
+
 def plot_site_mechanism_context(
     mechanism_df: pd.DataFrame,
     sample_col: str = "sample_id",
@@ -2847,47 +2940,15 @@ def plot_site_mechanism_context(
     figsize=(9.5, 6.0),
     title="SV-A-to-I mechanism context",
 ):
-    if mechanism_df is None or mechanism_df.empty:
-        raise ValueError("mechanism_df is empty.")
-
-    df = mechanism_df.copy()
-    if sample_col not in df.columns:
-        df[sample_col] = "sample"
-    if "mechanism_class" not in df.columns:
-        df["mechanism_class"] = "unresolved"
-
-    site_order = df[site_col].astype(str).drop_duplicates().head(top_n_sites).tolist()
-    df = df[df[site_col].astype(str).isin(site_order)].copy()
-    df[site_col] = pd.Categorical(df[site_col].astype(str), categories=site_order[::-1], ordered=True)
-
-    palette = {
-        "miRNA/3UTR regulation": "#66a61e",
-        "repeat/ADAR substrate": "#d95f02",
-        "known RNA-editing site": "#1b9e77",
-        "RBP binding/regulation": "#7570b3",
-        "multi-source evidence": "#e7298a",
-        "unresolved": "#bdbdbd",
-    }
-    fig, ax = plt.subplots(figsize=figsize)
-    for cls, sub in df.groupby("mechanism_class", observed=True):
-        ax.scatter(
-            sub[sample_col].astype(str),
-            sub[site_col].astype(str),
-            s=82,
-            color=palette.get(str(cls), "#8c8c8c"),
-            edgecolor="black",
-            linewidth=0.4,
-            alpha=0.9,
-            label=str(cls),
-        )
-
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    ax.set_title(title)
-    ax.grid(axis="x", color="#eeeeee", linewidth=0.8)
-    ax.legend(frameon=False, fontsize=8, title="", bbox_to_anchor=(1.02, 1), loc="upper left")
-    plt.tight_layout()
-    return fig, ax, df
+    """Backward-compatible alias for the three-slice SV-A-to-I UpSet plot."""
+    del top_n_sites
+    if title in {"SV-A-to-I mechanism context",
+                 "Detected SV-A-to-I sites: mechanism context"}:
+        title = "SV-A-to-I site overlap across three slices"
+    return plot_three_slice_sv_atoi_upset(
+        mechanism_df, sample_col=sample_col, site_col=site_col,
+        figsize=figsize, title=title,
+    )
 
 
 def prepare_rbp_followup_table(
@@ -4551,10 +4612,20 @@ def detect_spatial_atoi_sites_counts(
     return result
 
 
-def plot_count_spatial_discovery(sv_atoi, figsize=(5, 4)):
-    """Plot only all/QC pass/SV counts; use the supplied is_sv_atoi calls."""
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=figsize)
+def plot_count_spatial_discovery(sv_atoi, figsize=(14.5, 4.2)):
+    """Plot discovery counts plus significance/effect and coverage diagnostics."""
+    required = {"pass_qc", "is_sv_atoi", "spatial_effect", "spatial_p",
+                "total_cov_valid"}
+    missing = sorted(required.difference(sv_atoi.columns))
+    if missing:
+        raise ValueError(f"sv_atoi is missing required columns: {missing}")
+
+    df = sv_atoi.copy()
+    qc = df["pass_qc"].fillna(False).astype(bool)
+    called = df["is_sv_atoi"].fillna(False).astype(bool)
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    ax = axes[0]
     counts = [len(sv_atoi), int(sv_atoi.pass_qc.sum()), int(sv_atoi.is_sv_atoi.sum())]
     bars = ax.bar(["all", "QC pass", "SV"], counts,
                   color=["#bdbdbd", "#f28e2b", "#59a14f"])
@@ -4563,8 +4634,42 @@ def plot_count_spatial_discovery(sv_atoi, figsize=(5, 4)):
     for bar, value in zip(bars, counts):
         ax.annotate(str(value), (bar.get_x()+bar.get_width()/2, value),
                     xytext=(0, 4), textcoords="offset points", ha="center", va="bottom")
+
+    ax = axes[1]
+    plot_df = df.loc[qc & np.isfinite(df["spatial_p"]) &
+                     np.isfinite(df["spatial_effect"])].copy()
+    plot_df["minus_log10_p"] = -np.log10(
+        plot_df["spatial_p"].astype(float).clip(lower=np.finfo(float).tiny)
+    )
+    selected = called.loc[plot_df.index]
+    ax.scatter(plot_df.loc[~selected, "spatial_effect"],
+               plot_df.loc[~selected, "minus_log10_p"], s=20,
+               color="#9e9e9e", alpha=0.65, linewidth=0, label="not called")
+    ax.scatter(plot_df.loc[selected, "spatial_effect"],
+               plot_df.loc[selected, "minus_log10_p"], s=28,
+               color="#59a14f", alpha=0.9, linewidth=0, label="SV-A-to-I")
+    if "p_cutoff" in df.columns:
+        cutoffs = pd.to_numeric(df["p_cutoff"], errors="coerce").dropna()
+        if not cutoffs.empty and cutoffs.iloc[0] > 0:
+            ax.axhline(-np.log10(cutoffs.iloc[0]), color="#d62728", ls="--", lw=1)
+    ax.set(xlabel="Spatial effect (P95 - P5)", ylabel="-log10(spatial p)",
+           title="Spatial count regression")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[2]
+    cov = pd.to_numeric(df["total_cov_valid"], errors="coerce")
+    effect = pd.to_numeric(df["spatial_effect"], errors="coerce")
+    valid = qc & np.isfinite(cov) & (cov > 0) & np.isfinite(effect)
+    ax.scatter(cov[valid & ~called], effect[valid & ~called], s=20,
+               color="#9e9e9e", alpha=0.6, linewidth=0)
+    ax.scatter(cov[valid & called], effect[valid & called], s=28,
+               color="#59a14f", alpha=0.9, linewidth=0)
+    ax.set_xscale("log")
+    ax.set(xlabel="Total coverage across valid spots (log scale)",
+           ylabel="Spatial effect (P95 - P5)",
+           title="Coverage and spatial effect")
     fig.tight_layout()
-    return fig, ax
+    return fig, axes
 
 
 def validate_counts(d):
