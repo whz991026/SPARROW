@@ -1028,6 +1028,8 @@ def _spatial_axes(
     spot_size: int = 18,
     clip=(1, 99),
     center=None,
+    vmin=None,
+    vmax=None,
 ):
     coords = _plot_coords_from_adata(adata)
 
@@ -1056,7 +1058,10 @@ def _spatial_axes(
         ax.axis("off")
         return None
 
-    vmin, vmax = np.nanpercentile(values[mask], clip)
+    if vmin is None or vmax is None:
+        auto_vmin, auto_vmax = np.nanpercentile(values[mask], clip)
+        vmin = auto_vmin if vmin is None else vmin
+        vmax = auto_vmax if vmax is None else vmax
 
     if center is not None:
         lim = max(abs(vmin - center), abs(vmax - center))
@@ -1754,6 +1759,7 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     display_upper_quantile: float = 0.98,
     display_box_pad_iqr: float = 0.35,
     min_group_size_for_ylim: int = 4,
+    y_limits: Optional[Tuple[float, float]] = None,
     max_points_per_group: Optional[int] = 25,
     random_state: int = 0,
 ):
@@ -1841,7 +1847,12 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     if handles:
         ax.legend(handles[:2], labels[:2], frameon=False, title="")
 
-    if robust_ylim and np.isfinite(y_lower) and np.isfinite(y_upper) and y_upper > y_lower:
+    if y_limits is not None:
+        y0, y1 = map(float, y_limits)
+        if not np.isfinite([y0, y1]).all() or y1 <= y0:
+            raise ValueError("y_limits must be a finite increasing (lower, upper) pair.")
+        ax.set_ylim(y0, y1)
+    elif robust_ylim and np.isfinite(y_lower) and np.isfinite(y_upper) and y_upper > y_lower:
         span = y_upper - y_lower
         ax.set_ylim(max(0, y_lower - 0.05 * span), min(1, y_upper + 0.16 * span))
 
@@ -1850,10 +1861,13 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
         if sample_col in s.columns:
             if fdr_col not in s.columns and "pval" in s.columns:
                 s[fdr_col] = _safe_multipletest(s["pval"])
-            ymax = y_upper if robust_ylim and np.isfinite(y_upper) else pd.to_numeric(df[value_col], errors="coerce").max()
-            ymin = y_lower if robust_ylim and np.isfinite(y_lower) else pd.to_numeric(df[value_col], errors="coerce").min()
+            if y_limits is not None:
+                ymin, ymax = map(float, y_limits)
+            else:
+                ymax = y_upper if robust_ylim and np.isfinite(y_upper) else pd.to_numeric(df[value_col], errors="coerce").max()
+                ymin = y_lower if robust_ylim and np.isfinite(y_lower) else pd.to_numeric(df[value_col], errors="coerce").min()
             span = ymax - ymin if np.isfinite(ymax) and np.isfinite(ymin) and ymax > ymin else 0.1
-            y_text = ymax + span * 0.06
+            y_text = (ymax - span * 0.04) if y_limits is not None else (ymax + span * 0.06)
             sample_order = list(dict.fromkeys(df[sample_col].astype(str)))
             for x, sample in enumerate(sample_order):
                 row = s[s[sample_col].astype(str) == str(sample)]
@@ -1865,14 +1879,17 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
                 label = f"{stat_name}={q:.2g}" if np.isfinite(q) else f"{stat_name}=NA"
                 if np.isfinite(effect):
                     label = f"{label}\nΔ={effect:.2g}"
-                ax.text(x, y_text, label, ha="center", va="bottom", fontsize=8)
+                ax.text(x, y_text, label, ha="center",
+                        va="top" if y_limits is not None else "bottom", fontsize=8)
 
     ax.set_xlabel("")
     ax.set_ylabel("editing ratio")
     ax.set_title(title)
     # Apply the limits last.  Seaborn artists and significance annotations
     # created above must not be allowed to autoscale the y axis afterwards.
-    if robust_ylim and np.isfinite(y_lower) and np.isfinite(y_upper) and y_upper > y_lower:
+    if y_limits is not None:
+        ax.set_ylim(*map(float, y_limits))
+    elif robust_ylim and np.isfinite(y_lower) and np.isfinite(y_upper) and y_upper > y_lower:
         span = y_upper - y_lower
         ax.set_ylim(max(0, y_lower - 0.05 * span), min(1, y_upper + 0.16 * span))
     plt.tight_layout()
@@ -1893,10 +1910,16 @@ def analyze_three_slice_recurrent_sv_wm(
     wm_pattern: str = r"(?:^WM$|white)",
     min_cov: int = 5,
     alpha: float = 0.05,
+    test_method: str = "quasibinomial_lrt",
 ):
     """Test every three-slice recurrent SV-A-to-I site for WM enrichment.
 
-    Selection first requires the two-sided Mann-Whitney raw p value to be below
+    ``test_method='quasibinomial_lrt'`` models edited reads out of total reads
+    and scales the likelihood-ratio statistic by Pearson overdispersion.  This
+    respects unequal site coverage and is the default confirmatory test.
+    ``test_method='mannwhitney'`` retains the earlier ratio-rank test.
+
+    Selection first requires the chosen test's raw p value to be below
     ``alpha`` independently in all three slices.  If no site passes that strict
     rule, the fallback is the lowest Fisher combined p among sites tested in
     all three slices whose Fisher p is below ``alpha``.
@@ -1904,6 +1927,9 @@ def analyze_three_slice_recurrent_sv_wm(
     ``adata_ai.h5ad`` and ``cluster_labels_<sample>.csv`` are loaded per slice.
     """
     samples = [str(x) for x in sample_ids]
+    test_method = str(test_method).lower()
+    if test_method not in {"quasibinomial_lrt", "mannwhitney"}:
+        raise ValueError("test_method must be 'quasibinomial_lrt' or 'mannwhitney'.")
     if len(samples) != 3:
         raise ValueError("sample_ids must contain exactly three slice IDs.")
     required = {sample_col, site_col, call_col}
@@ -1950,28 +1976,64 @@ def analyze_three_slice_recurrent_sv_wm(
         is_wm = labels.astype(str).str.contains(
             wm_pattern, case=False, regex=True, na=False
         )
+        A, G = _get_count_layers(adata)
         for site in common_sites:
             if site not in adata.var_names:
                 continue
             ratio = get_site_editing_ratio(adata, site=site, min_cov=min_cov)
             ratios_by_key[(sample, site)] = (ratio, labels, is_wm)
-            frame = pd.DataFrame({"value": ratio, "is_wm": is_wm.to_numpy()}).dropna()
+            j = adata.var_names.get_loc(site)
+            edited = _dense_col(G, j)
+            total = edited + _dense_col(A, j)
+            frame = pd.DataFrame({
+                "value": ratio, "edited": edited, "total": total,
+                "group": labels, "is_wm": is_wm.to_numpy(),
+            }).dropna(subset=["value", "group"])
             wm_values = frame.loc[frame["is_wm"], "value"].to_numpy(float)
             nonwm_values = frame.loc[~frame["is_wm"], "value"].to_numpy(float)
+            mw_u = mw_p = np.nan
             if len(wm_values) and len(nonwm_values):
                 test = mannwhitneyu(wm_values, nonwm_values, alternative="two-sided")
-                pval = float(test.pvalue)
-                statistic = float(test.statistic)
+                mw_p = float(test.pvalue)
+                mw_u = float(test.statistic)
+
+            binomial_lrt = binomial_p = dispersion = np.nan
+            if frame["is_wm"].any() and (~frame["is_wm"]).any():
+                g = frame["edited"].to_numpy(float)
+                n = frame["total"].to_numpy(float)
+                wm_design = frame["is_wm"].to_numpy(float)
+                try:
+                    x0 = np.ones((len(frame), 1), dtype=float)
+                    x1 = np.column_stack([np.ones(len(frame)), wm_design])
+                    ll0, _ = _fit_binomial(g, n, x0)
+                    ll1, fitted = _fit_binomial(g, n, x1)
+                    binomial_lrt = max(0.0, 2.0 * (ll1 - ll0))
+                    denom = np.maximum(n * fitted * (1.0 - fitted), 1e-12)
+                    dispersion = max(
+                        1.0,
+                        float(np.sum((g - n * fitted) ** 2 / denom) / max(len(g) - 2, 1)),
+                    )
+                    binomial_p = float(chi2.sf(binomial_lrt / dispersion, 1))
+                except (RuntimeError, ValueError, np.linalg.LinAlgError):
+                    pass
+
+            if test_method == "quasibinomial_lrt":
+                pval, statistic = binomial_p, binomial_lrt
             else:
-                pval = statistic = np.nan
+                pval, statistic = mw_p, mw_u
             rows.append({
                 "site": site, "sample_id": sample,
+                "test_method": test_method,
                 "n_wm": len(wm_values), "n_nonwm": len(nonwm_values),
                 "mean_wm": np.nanmean(wm_values) if len(wm_values) else np.nan,
                 "mean_nonwm": np.nanmean(nonwm_values) if len(nonwm_values) else np.nan,
                 "wm_minus_nonwm": (np.nanmean(wm_values) - np.nanmean(nonwm_values)
                                     if len(wm_values) and len(nonwm_values) else np.nan),
-                "mannwhitney_u": statistic, "pval": pval,
+                "mannwhitney_u": mw_u, "mannwhitney_p": mw_p,
+                "binomial_lrt": binomial_lrt,
+                "pearson_dispersion": dispersion,
+                "quasibinomial_lrt_p": binomial_p,
+                "test_statistic": statistic, "pval": pval,
             })
 
     per_slice = pd.DataFrame(rows)
@@ -2050,13 +2112,19 @@ def analyze_three_slice_recurrent_sv_wm(
 
 def plot_cross_sample_recurrent_site_cluster_ratios(
     cluster_df: pd.DataFrame,
+    adata_by_sample: Optional[dict] = None,
+    data_root: Optional[Union[str, Path]] = None,
     sample_col: str = "sample_id",
     group_col: str = "group",
     value_col: str = "editing_ratio",
-    figsize=(9.0, 4.5),
+    group_key: str = "ground_truth",
+    min_cov: int = 5,
+    spot_size: int = 18,
+    cmap: str = "magma",
+    figsize=(12.0, 4.2),
     title: Optional[str] = None,
 ):
-    """Plot the selected recurrent site's cluster-mean ratio in three slices."""
+    """Plot one recurrent site's cluster-mean spatial map in three slices."""
     required = {sample_col, group_col, value_col}
     if cluster_df is None or cluster_df.empty:
         raise ValueError("cluster_df is empty; no three-slice significant site was selected.")
@@ -2064,19 +2132,68 @@ def plot_cross_sample_recurrent_site_cluster_ratios(
     if missing:
         raise ValueError(f"cluster_df is missing required columns: {sorted(missing)}")
     df = cluster_df.copy()
-    preferred = [f"Layer_{i}" for i in range(1, 7)] + ["WM"]
-    observed = df[group_col].astype(str).drop_duplicates().tolist()
-    order = [x for x in preferred if x in observed] + [x for x in observed if x not in preferred]
-    fig, ax = plt.subplots(figsize=figsize)
-    sns.pointplot(data=df, x=group_col, y=value_col, hue=sample_col,
-                  order=order, ci=None, dodge=0.28, markers="o", ax=ax)
     site = str(df["site"].iloc[0]) if "site" in df.columns else ""
-    ax.set(xlabel="DLPFC cluster", ylabel="Mean A-to-I ratio",
-           title=title or f"Recurrent SV-A-to-I site {site}: cluster ratios")
-    ax.tick_params(axis="x", rotation=35)
-    ax.legend(frameon=False, title="Slice")
+    if not site:
+        raise ValueError("cluster_df must contain the selected site.")
+    samples = df[sample_col].astype(str).drop_duplicates().tolist()
+
+    if adata_by_sample is None:
+        if data_root is None:
+            raise ValueError("Provide adata_by_sample or data_root for spatial maps.")
+        import anndata as ad
+        root = Path(data_root)
+        adata_by_sample = {}
+        for sample in samples:
+            adata = ad.read_h5ad(root / sample / "adata_ai.h5ad")
+            labels = pd.read_csv(root / sample / f"cluster_labels_{sample}.csv")
+            labels["barcode"] = labels["key"].astype(str).str.split("_", n=1).str[-1]
+            adata.obs[group_key] = labels.set_index("barcode")[group_key].reindex(
+                adata.obs_names
+            ).to_numpy()
+            adata_by_sample[sample] = adata
+
+    mapped = {}
+    summary_rows = []
+    all_cluster_means = []
+    for sample in samples:
+        adata = adata_by_sample[sample]
+        labels = _valid_group_series(adata, group_key=group_key)
+        ratio = get_site_editing_ratio(adata, site=site, min_cov=min_cov)
+        means = pd.DataFrame({"ratio": ratio, "group": labels}).dropna().groupby(
+            "group", observed=True
+        )["ratio"].mean()
+        values = labels.map(means).astype(float)
+        mapped[sample] = (adata, values)
+        all_cluster_means.extend(means.to_numpy(float).tolist())
+        for group, value in means.items():
+            summary_rows.append({sample_col: sample, "site": site,
+                                 group_col: group, value_col: float(value)})
+
+    finite_means = np.asarray(all_cluster_means, dtype=float)
+    finite_means = finite_means[np.isfinite(finite_means)]
+    if finite_means.size:
+        vmin, vmax = np.nanpercentile(finite_means, [1, 99])
+        if vmax <= vmin:
+            vmax = vmin + np.finfo(float).eps
+    else:
+        vmin = vmax = None
+
+    fig, axes = plt.subplots(1, len(samples), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+    color_artist = None
+    for ax, sample in zip(axes, samples):
+        adata, values = mapped[sample]
+        color_artist = _spatial_axes(
+            ax, adata, values.to_numpy(float), str(sample), cmap=cmap,
+            spot_size=spot_size, vmin=vmin, vmax=vmax,
+        )
+    if color_artist is not None:
+        fig.colorbar(color_artist, ax=list(axes), fraction=0.025, pad=0.02,
+                     label="Cluster mean A-to-I ratio")
+    fig.suptitle(title or f"Recurrent SV-A-to-I site {site}: cluster-level spatial maps",
+                 fontsize=13, y=1.02)
     fig.tight_layout()
-    return fig, ax, df
+    return fig, axes, pd.DataFrame(summary_rows)
 
 
 def annotate_sv_atoi_sites(
