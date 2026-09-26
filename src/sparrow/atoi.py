@@ -16,13 +16,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import statsmodels.api as sm
 from scipy import sparse
-from scipy.stats import spearmanr, pearsonr, mannwhitneyu
+from scipy.stats import spearmanr, pearsonr, mannwhitneyu, fisher_exact
 from statsmodels.stats.multitest import multipletests
 from matplotlib.patches import Patch
 from scipy.linalg import qr
 from scipy.optimize import minimize
-from scipy.special import expit, logit, gammaln
-from scipy.stats import chi2
+from scipy.special import expit, logit, gammaln, betaln
+from scipy.stats import chi2, norm
 import unicodedata
 
 __all__ = ['add_celltype_composition_modules', 'add_gene_expression_to_obs', 'add_obs_zmean_score', 'analyze_adar_spatial_correlation', 'analyze_score_vs_celltypes', 'analyze_single_site_wm_enrichment', 'analyze_wm_enrichment_for_sv_sites', 'annotate_sv_atoi_sites', 'collapse_deconvolution_to_clusters', 'compute_global_atoi_ratio', 'compute_multisite_atoi_score', 'compute_obs_spatial_autocorrelation', 'compute_sv_atoi_score', 'detect_spatial_atoi_sites_counts', 'filter_atoi_sites', 'fit_adjustment_model', 'fit_joint_atoi_model', 'infer_sv_site_mechanism_context', 'install_figure_pdf_export', 'parse_dlpfc_celltype_group', 'plot_bivariate_colocalization', 'plot_celltype_module_deconvolution_summary', 'plot_cluster_adar_correlation_heatmap', 'plot_cluster_level_obs_panel', 'plot_cluster_level_obs_value', 'plot_cluster_score_comparison', 'plot_count_spatial_discovery', 'plot_cross_sample_r2_decomposition', 'plot_cross_sample_recurrent_site_wm_boxplot', 'plot_cross_sample_sv_score_wm_enrichment', 'plot_external_overlap_summary', 'plot_global_atoi_two_r2_donuts', 'plot_residual_progression', 'plot_site_mechanism_context', 'plot_top_sv_site_patterns', 'run_core_analysis', 'run_sv_external_mechanism_overlaps', 'set_spatial_background', 'summarize_top_sv_atoi_sites', 'transfer_obs_metadata']
@@ -32,6 +32,10 @@ _SPATIAL_IMAGE_CACHE = {}
 __all__.append("plot_three_slice_sv_atoi_upset")
 __all__.extend([
     "analyze_three_slice_recurrent_sv_wm",
+    "analyze_recurrent_sv_wm_fisher",
+    "fit_global_atoi_count_joint_model",
+    "plot_global_count_joint_cluster_summary",
+    "analyze_recurrent_sv_wm_binomial",
     "plot_cross_sample_recurrent_site_cluster_ratios",
 ])
 
@@ -1760,6 +1764,7 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     display_box_pad_iqr: float = 0.35,
     min_group_size_for_ylim: int = 4,
     y_limits: Optional[Tuple[float, float]] = None,
+    box_level: str = "spot",
     max_points_per_group: Optional[int] = 25,
     random_state: int = 0,
 ):
@@ -1781,12 +1786,25 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    plot_points = df.copy()
+    box_level = str(box_level).lower()
+    if box_level not in {"spot", "cluster"}:
+        raise ValueError("box_level must be 'spot' or 'cluster'.")
+    if box_level == "cluster":
+        if "group" not in df.columns:
+            raise ValueError("Cluster-level boxplots require a 'group' column.")
+        box_df = (
+            df.dropna(subset=[value_col, "group"])
+            .groupby([sample_col, region_col, "group"], observed=True, as_index=False)
+            [value_col].mean()
+        )
+    else:
+        box_df = df.dropna(subset=[value_col]).copy()
+    plot_points = box_df.copy()
     y_lower = y_upper = np.nan
 
     if robust_ylim:
         display_bounds = []
-        for _, sub in df.groupby([sample_col, region_col], observed=True):
+        for _, sub in box_df.groupby([sample_col, region_col], observed=True):
             values = sub[value_col].dropna().astype(float)
             # A group represented by only one or two covered spots can contain
             # a single ratio near 1 and should not determine the display range.
@@ -1821,7 +1839,7 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     fig, ax = plt.subplots(figsize=figsize)
 
     sns.boxplot(
-        data=df,
+        data=box_df,
         x=sample_col,
         y=value_col,
         hue=region_col,
@@ -1870,7 +1888,7 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
                         va="top" if y_limits is not None else "bottom", fontsize=8)
 
     ax.set_xlabel("")
-    ax.set_ylabel("editing ratio")
+    ax.set_ylabel("cluster mean editing ratio" if box_level == "cluster" else "editing ratio")
     ax.set_title(title)
     # Apply the limits last.  Seaborn artists and significance annotations
     # created above must not be allowed to autoscale the y axis afterwards.
@@ -1886,6 +1904,64 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
     return fig, ax, df
 
 
+def _fit_beta_binomial_counts(edited, total, design):
+    """Maximum-likelihood beta-binomial regression with one precision term."""
+    edited = np.asarray(edited, dtype=float)
+    total = np.asarray(total, dtype=float)
+    design = np.asarray(design, dtype=float)
+    if design.ndim != 2 or len(edited) != design.shape[0]:
+        raise ValueError("Invalid beta-binomial design dimensions.")
+    if np.any(total <= 0) or np.any(edited < 0) or np.any(edited > total):
+        raise ValueError("Invalid edited/total counts.")
+
+    overall = np.clip(edited.sum() / total.sum(), 1e-6, 1 - 1e-6)
+    initial = np.zeros(design.shape[1] + 1, dtype=float)
+    initial[0] = logit(overall)
+    initial[-1] = np.log(20.0)
+    logchoose = gammaln(total + 1) - gammaln(edited + 1) - gammaln(total - edited + 1)
+
+    def objective(theta):
+        eta = np.clip(design @ theta[:-1], -25, 25)
+        mean = expit(eta)
+        precision = np.exp(np.clip(theta[-1], -8, 15))
+        alpha = np.clip(mean * precision, 1e-10, None)
+        beta = np.clip((1 - mean) * precision, 1e-10, None)
+        ll = np.sum(
+            logchoose + betaln(edited + alpha, total - edited + beta)
+            - betaln(alpha, beta)
+        )
+        return -float(ll)
+
+    bounds = [(-20, 20)] * design.shape[1] + [(-8, 15)]
+    fit = minimize(objective, initial, method="L-BFGS-B", bounds=bounds,
+                   options={"maxiter": 1000, "ftol": 1e-10})
+    if not fit.success or not np.isfinite(fit.fun):
+        raise RuntimeError("beta-binomial optimizer did not converge")
+    return fit.x, -float(fit.fun), objective
+
+
+def _finite_difference_hessian(func, point, relative_step=2e-4):
+    """Central finite-difference Hessian for a small fitted parameter vector."""
+    point = np.asarray(point, dtype=float)
+    n = len(point)
+    step = relative_step * np.maximum(1.0, np.abs(point))
+    hessian = np.empty((n, n), dtype=float)
+    f0 = func(point)
+    for i in range(n):
+        ei = np.zeros(n)
+        ei[i] = step[i]
+        hessian[i, i] = (func(point + ei) - 2 * f0 + func(point - ei)) / step[i] ** 2
+        for j in range(i + 1, n):
+            ej = np.zeros(n)
+            ej[j] = step[j]
+            value = (
+                func(point + ei + ej) - func(point + ei - ej)
+                - func(point - ei + ej) + func(point - ei - ej)
+            ) / (4 * step[i] * step[j])
+            hessian[i, j] = hessian[j, i] = value
+    return hessian
+
+
 def analyze_three_slice_recurrent_sv_wm(
     sv_calls: pd.DataFrame,
     adata_by_sample: Optional[dict] = None,
@@ -1894,33 +1970,48 @@ def analyze_three_slice_recurrent_sv_wm(
     sample_col: str = "Slice",
     site_col: str = "site",
     call_col: str = "is_sv_atoi",
+    require_called: bool = True,
     group_key: str = "ground_truth",
     wm_pattern: str = r"(?:^WM$|white)",
     min_cov: int = 5,
     alpha: float = 0.05,
-    test_method: str = "quasibinomial_lrt",
+    test_method: str = "beta_binomial_lrt",
+    min_wm_spots: int = 10,
+    min_nonwm_spots: int = 20,
+    min_edited_reads_per_group: int = 5,
 ):
-    """Test every three-slice recurrent SV-A-to-I site for WM enrichment.
+    """Test three-slice shared A-to-I sites for WM enrichment.
 
-    ``test_method='quasibinomial_lrt'`` models edited reads out of total reads
-    and scales the likelihood-ratio statistic by Pearson overdispersion.  This
-    respects unequal site coverage and is the default confirmatory test.
+    By default, only sites called as SV-A-to-I in every slice are tested.
+    Set ``require_called=False`` to use every global site present in all three
+    slices (the call column is then optional); this is intended as a broader
+    sensitivity analysis.
+
+    ``test_method='beta_binomial_lrt'`` models edited reads out of total reads,
+    adjusts for standardized x/y coordinates and estimates extra-binomial
+    dispersion. It is the default confirmatory test. Sites failing the minimum
+    WM/non-WM spot or edited-read support are marked insufficient rather than
+    assigned a p value.
+    ``test_method='quasibinomial_lrt'`` is retained as a sensitivity analysis.
     ``test_method='mannwhitney'`` retains the earlier ratio-rank test.
 
-    Selection first requires the chosen test's raw p value to be below
-    ``alpha`` independently in all three slices.  If no site passes that strict
-    rule, the fallback is the lowest Fisher combined p among sites tested in
-    all three slices whose Fisher p is below ``alpha``.
+    Selection requires estimates from all three slices, a consistent effect
+    direction, and random-effects meta-analysis FDR below ``alpha``.
     ``data_root`` may be supplied instead of ``adata_by_sample``; in that case
     ``adata_ai.h5ad`` and ``cluster_labels_<sample>.csv`` are loaded per slice.
     """
     samples = [str(x) for x in sample_ids]
     test_method = str(test_method).lower()
-    if test_method not in {"quasibinomial_lrt", "mannwhitney"}:
-        raise ValueError("test_method must be 'quasibinomial_lrt' or 'mannwhitney'.")
+    valid_methods = {"beta_binomial_lrt", "quasibinomial_lrt", "mannwhitney"}
+    if test_method not in valid_methods:
+        raise ValueError(f"test_method must be one of {sorted(valid_methods)}.")
+    if min_wm_spots < 1 or min_nonwm_spots < 1 or min_edited_reads_per_group < 0:
+        raise ValueError("Minimum support thresholds must be positive/nonnegative.")
     if len(samples) != 3:
         raise ValueError("sample_ids must contain exactly three slice IDs.")
-    required = {sample_col, site_col, call_col}
+    required = {sample_col, site_col}
+    if require_called:
+        required.add(call_col)
     missing = required.difference(sv_calls.columns)
     if missing:
         raise ValueError(f"sv_calls is missing required columns: {sorted(missing)}")
@@ -1928,11 +2019,13 @@ def analyze_three_slice_recurrent_sv_wm(
     calls = sv_calls.copy()
     calls[sample_col] = calls[sample_col].astype(str)
     calls[site_col] = calls[site_col].astype(str)
-    calls = calls.loc[calls[call_col].fillna(False).astype(bool)]
+    if require_called:
+        calls = calls.loc[calls[call_col].fillna(False).astype(bool)]
     site_sets = [set(calls.loc[calls[sample_col].eq(s), site_col]) for s in samples]
     common_sites = sorted(set.intersection(*site_sets))
     if not common_sites:
-        raise ValueError("No called SV-A-to-I site is shared by all three slices.")
+        scope = "called SV-A-to-I" if require_called else "global A-to-I"
+        raise ValueError(f"No {scope} site is shared by all three slices.")
 
     if adata_by_sample is None:
         if data_root is None:
@@ -1965,6 +2058,7 @@ def analyze_three_slice_recurrent_sv_wm(
             wm_pattern, case=False, regex=True, na=False
         )
         A, G = _get_count_layers(adata)
+        coords = _coords_from_adata(adata)
         for site in common_sites:
             if site not in adata.var_names:
                 continue
@@ -1976,6 +2070,7 @@ def analyze_three_slice_recurrent_sv_wm(
             frame = pd.DataFrame({
                 "value": ratio, "edited": edited, "total": total,
                 "group": labels, "is_wm": is_wm.to_numpy(),
+                "x": coords[:, 0], "y": coords[:, 1],
             }).dropna(subset=["value", "group"])
             wm_values = frame.loc[frame["is_wm"], "value"].to_numpy(float)
             nonwm_values = frame.loc[~frame["is_wm"], "value"].to_numpy(float)
@@ -2005,14 +2100,61 @@ def analyze_three_slice_recurrent_sv_wm(
                 except (RuntimeError, ValueError, np.linalg.LinAlgError):
                     pass
 
-            if test_method == "quasibinomial_lrt":
+            n_wm = int(frame["is_wm"].sum())
+            n_nonwm = int((~frame["is_wm"]).sum())
+            edited_wm = float(frame.loc[frame["is_wm"], "edited"].sum())
+            edited_nonwm = float(frame.loc[~frame["is_wm"], "edited"].sum())
+            sufficient = (
+                n_wm >= int(min_wm_spots)
+                and n_nonwm >= int(min_nonwm_spots)
+                and edited_wm >= float(min_edited_reads_per_group)
+                and edited_nonwm >= float(min_edited_reads_per_group)
+            )
+            beta_lrt = beta_p = wm_log_odds = wm_log_odds_se = np.nan
+            beta_precision = np.nan
+            fit_status = "insufficient_support"
+            if sufficient and np.isfinite(frame[["x", "y"]].to_numpy(float)).all():
+                xy = frame[["x", "y"]].to_numpy(float)
+                xy -= xy.mean(axis=0)
+                xy_scale = xy.std(axis=0)
+                xy_scale[xy_scale == 0] = 1.0
+                xy /= xy_scale
+                g = frame["edited"].to_numpy(float)
+                n = frame["total"].to_numpy(float)
+                wm_design = frame["is_wm"].to_numpy(float)
+                x0 = np.column_stack([np.ones(len(frame)), xy])
+                x1 = np.column_stack([np.ones(len(frame)), xy, wm_design])
+                try:
+                    _, ll0, _ = _fit_beta_binomial_counts(g, n, x0)
+                    theta1, ll1, objective1 = _fit_beta_binomial_counts(g, n, x1)
+                    beta_lrt = max(0.0, 2.0 * (ll1 - ll0))
+                    beta_p = float(chi2.sf(beta_lrt, 1))
+                    wm_log_odds = float(theta1[-2])
+                    beta_precision = float(np.exp(theta1[-1]))
+                    hessian = _finite_difference_hessian(objective1, theta1)
+                    covariance = np.linalg.pinv(hessian)
+                    variance = float(covariance[-2, -2])
+                    if np.isfinite(variance) and variance > 0:
+                        wm_log_odds_se = float(np.sqrt(variance))
+                    fit_status = "ok"
+                except (RuntimeError, ValueError, np.linalg.LinAlgError, FloatingPointError):
+                    fit_status = "fit_failed"
+
+            if test_method == "beta_binomial_lrt":
+                pval, statistic = beta_p, beta_lrt
+            elif test_method == "quasibinomial_lrt":
                 pval, statistic = binomial_p, binomial_lrt
             else:
                 pval, statistic = mw_p, mw_u
+            if not sufficient:
+                pval = statistic = np.nan
             rows.append({
                 "site": site, "sample_id": sample,
                 "test_method": test_method,
-                "n_wm": len(wm_values), "n_nonwm": len(nonwm_values),
+                "fit_status": fit_status,
+                "n_wm": n_wm, "n_nonwm": n_nonwm,
+                "edited_reads_wm": edited_wm,
+                "edited_reads_nonwm": edited_nonwm,
                 "mean_wm": np.nanmean(wm_values) if len(wm_values) else np.nan,
                 "mean_nonwm": np.nanmean(nonwm_values) if len(nonwm_values) else np.nan,
                 "wm_minus_nonwm": (np.nanmean(wm_values) - np.nanmean(nonwm_values)
@@ -2021,13 +2163,23 @@ def analyze_three_slice_recurrent_sv_wm(
                 "binomial_lrt": binomial_lrt,
                 "pearson_dispersion": dispersion,
                 "quasibinomial_lrt_p": binomial_p,
+                "beta_binomial_lrt": beta_lrt,
+                "beta_binomial_lrt_p": beta_p,
+                "wm_log_odds": wm_log_odds,
+                "wm_log_odds_se": wm_log_odds_se,
+                "wm_odds_ratio": np.exp(wm_log_odds) if np.isfinite(wm_log_odds) else np.nan,
+                "beta_binomial_precision": beta_precision,
                 "test_statistic": statistic, "pval": pval,
             })
 
     per_slice = pd.DataFrame(rows)
-    per_slice["fdr_within_slice"] = per_slice.groupby("sample_id")["pval"].transform(
-        _safe_multipletest
-    )
+    per_slice["fdr_within_slice"] = np.nan
+    for sample, index in per_slice.groupby("sample_id").groups.items():
+        valid_index = per_slice.loc[index].index[per_slice.loc[index, "pval"].notna()]
+        if len(valid_index):
+            per_slice.loc[valid_index, "fdr_within_slice"] = multipletests(
+                per_slice.loc[valid_index, "pval"].to_numpy(float), method="fdr_bh"
+            )[1]
     pivot = per_slice.pivot(index="site", columns="sample_id", values="pval").reindex(
         columns=samples
     )
@@ -2037,8 +2189,9 @@ def analyze_three_slice_recurrent_sv_wm(
     site_summary["n_slices_tested"] = pivot.notna().sum(axis=1)
     site_summary["max_p_across_slices"] = pivot.max(axis=1)
     site_summary["all_three_p_lt_alpha"] = all_significant
+    effect_column = "wm_log_odds" if test_method == "beta_binomial_lrt" else "wm_minus_nonwm"
     site_summary["direction_consistent"] = per_slice.pivot(
-        index="site", columns="sample_id", values="wm_minus_nonwm"
+        index="site", columns="sample_id", values=effect_column
     ).reindex(columns=samples).apply(
         lambda x: bool(x.notna().all() and ((x > 0).all() or (x < 0).all())), axis=1
     )
@@ -2050,21 +2203,58 @@ def analyze_three_slice_recurrent_sv_wm(
         site_summary.loc[site, ["fisher_statistic", "fisher_p"]] = [
             stat, float(chi2.sf(stat, 2 * len(samples)))
         ]
-    site_summary = site_summary.reset_index().sort_values(
-        ["all_three_p_lt_alpha", "fisher_p", "max_p_across_slices"],
-        ascending=[False, True, True], na_position="last"
-    ).reset_index(drop=True)
-    strict_candidates = site_summary.loc[site_summary["all_three_p_lt_alpha"]]
-    fisher_candidates = site_summary.loc[
-        site_summary["n_slices_tested"].eq(3)
-        & site_summary["fisher_p"].lt(float(alpha))
+
+    site_summary["meta_n_slices"] = 0
+    for col in ("meta_log_odds", "meta_se", "meta_ci_low", "meta_ci_high",
+                "meta_p", "meta_tau2", "meta_I2"):
+        site_summary[col] = np.nan
+    if test_method == "beta_binomial_lrt":
+        for site, sub in per_slice.groupby("site", observed=True):
+            valid_meta = sub["wm_log_odds"].notna() & sub["wm_log_odds_se"].gt(0)
+            sub = sub.loc[valid_meta]
+            if sub.empty:
+                continue
+            effects = sub["wm_log_odds"].to_numpy(float)
+            variances = sub["wm_log_odds_se"].to_numpy(float) ** 2
+            fixed_weights = 1.0 / variances
+            fixed_mean = float(np.sum(fixed_weights * effects) / np.sum(fixed_weights))
+            q = float(np.sum(fixed_weights * (effects - fixed_mean) ** 2))
+            df_q = len(effects) - 1
+            c = float(np.sum(fixed_weights) - np.sum(fixed_weights ** 2) / np.sum(fixed_weights))
+            tau2 = max(0.0, (q - df_q) / c) if df_q > 0 and c > 0 else 0.0
+            weights = 1.0 / (variances + tau2)
+            pooled = float(np.sum(weights * effects) / np.sum(weights))
+            pooled_se = float(np.sqrt(1.0 / np.sum(weights)))
+            meta_p = float(chi2.sf((pooled / pooled_se) ** 2, 1))
+            i2 = max(0.0, (q - df_q) / q) * 100 if q > 0 and df_q > 0 else 0.0
+            mask = site_summary.index == site
+            site_summary.loc[mask, "meta_n_slices"] = len(effects)
+            site_summary.loc[mask, ["meta_log_odds", "meta_se", "meta_ci_low",
+                                    "meta_ci_high", "meta_p", "meta_tau2", "meta_I2"]] = [
+                pooled, pooled_se, pooled - 1.96 * pooled_se,
+                pooled + 1.96 * pooled_se, meta_p, tau2, i2,
+            ]
+    site_summary["meta_fdr"] = np.nan
+    valid_meta_index = site_summary.index[
+        site_summary["meta_n_slices"].eq(3) & site_summary["meta_p"].notna()
     ]
-    if not strict_candidates.empty:
-        selected_site = str(strict_candidates.iloc[0]["site"])
-        selection_rule = "all_three_raw_p_lt_alpha"
-    elif not fisher_candidates.empty:
-        selected_site = str(fisher_candidates.iloc[0]["site"])
-        selection_rule = "fisher_p_lt_alpha_fallback"
+    if len(valid_meta_index):
+        site_summary.loc[valid_meta_index, "meta_fdr"] = multipletests(
+            site_summary.loc[valid_meta_index, "meta_p"].to_numpy(float), method="fdr_bh"
+        )[1]
+    site_summary["meta_significant"] = (
+        site_summary["meta_n_slices"].eq(3)
+        & site_summary["direction_consistent"]
+        & site_summary["meta_fdr"].lt(float(alpha))
+    )
+    site_summary = site_summary.reset_index().sort_values(
+        ["meta_significant", "meta_fdr", "meta_p", "fisher_p"],
+        ascending=[False, True, True, True], na_position="last"
+    ).reset_index(drop=True)
+    meta_candidates = site_summary.loc[site_summary["meta_significant"]]
+    if not meta_candidates.empty:
+        selected_site = str(meta_candidates.iloc[0]["site"])
+        selection_rule = "random_effects_meta_fdr_lt_alpha_direction_consistent"
     else:
         selected_site = None
         selection_rule = "none"
@@ -2096,6 +2286,688 @@ def analyze_three_slice_recurrent_sv_wm(
 
     return (site_summary, per_slice, pd.DataFrame(ratio_rows),
             pd.DataFrame(cluster_rows), selected_site)
+
+
+def analyze_recurrent_sv_wm_fisher(
+    sv_calls: pd.DataFrame,
+    adata_by_sample: Optional[dict] = None,
+    data_root: Optional[Union[str, Path]] = None,
+    sample_ids: Sequence[str] = ("151673", "151671", "151507"),
+    sample_col: str = "Slice",
+    site_col: str = "site",
+    call_col: str = "is_sv_atoi",
+    require_called: bool = True,
+    group_key: str = "ground_truth",
+    wm_pattern: str = r"(?:^WM$|white)",
+    min_cov: int = 5,
+    min_spots_per_group: int = 5,
+    pseudocount: float = 0.5,
+    alpha: float = 0.05,
+    min_log2fc: float = 1.0,
+):
+    """Run a simple per-slice read-count Fisher test for recurrent SV sites.
+
+    By default, a recurrent site must be called as SV-A-to-I in every requested
+    slice. Set ``require_called=False`` to test every global site shared by all
+    requested slices.
+    Within each slice, A and G reads are summed separately over WM and non-WM
+    spots whose site coverage is at least ``min_cov``.  The one-sided Fisher
+    test uses ``[[WM_G, WM_A], [nonWM_G, nonWM_A]]`` and tests whether the
+    WM G/A odds are greater.  ``log2fc`` is the log2 odds ratio calculated
+    with a Haldane-Anscombe pseudocount so zero cells remain finite.
+
+    This treats reads as independent and is therefore a sensitivity analysis,
+    not a replacement for the spot-level beta-binomial model.
+    """
+    samples = [str(x) for x in sample_ids]
+    if len(samples) < 2:
+        raise ValueError("sample_ids must contain at least two slice IDs.")
+    if min_cov < 0 or min_spots_per_group < 1 or pseudocount <= 0:
+        raise ValueError("min_cov/min_spots_per_group/pseudocount are invalid.")
+    required = {sample_col, site_col}
+    if require_called:
+        required.add(call_col)
+    missing = required.difference(sv_calls.columns)
+    if missing:
+        raise ValueError(f"sv_calls is missing required columns: {sorted(missing)}")
+
+    calls = sv_calls.copy()
+    calls[sample_col] = calls[sample_col].astype(str)
+    calls[site_col] = calls[site_col].astype(str)
+    if require_called:
+        calls = calls.loc[calls[call_col].fillna(False).astype(bool)]
+    site_sets = [set(calls.loc[calls[sample_col].eq(s), site_col]) for s in samples]
+    recurrent_sites = sorted(set.intersection(*site_sets))
+    if not recurrent_sites:
+        scope = "called SV-A-to-I" if require_called else "global A-to-I"
+        raise ValueError(f"No {scope} site is shared by all requested slices.")
+
+    if adata_by_sample is None:
+        if data_root is None:
+            raise ValueError("Provide adata_by_sample or data_root.")
+        import anndata as ad
+        root = Path(data_root)
+        adata_by_sample = {}
+        for sample in samples:
+            adata = ad.read_h5ad(root / sample / "adata_ai.h5ad")
+            label_path = root / sample / f"cluster_labels_{sample}.csv"
+            labels = pd.read_csv(label_path)
+            if "key" not in labels.columns or group_key not in labels.columns:
+                raise ValueError(f"Missing key/{group_key} columns in {label_path}")
+            labels["barcode"] = labels["key"].astype(str).str.split("_", n=1).str[-1]
+            adata.obs[group_key] = labels.set_index("barcode")[group_key].reindex(
+                adata.obs_names
+            ).to_numpy()
+            adata_by_sample[sample] = adata
+
+    rows = []
+    for sample in samples:
+        if sample not in adata_by_sample:
+            raise ValueError(f"adata_by_sample has no entry for {sample!r}.")
+        adata = adata_by_sample[sample]
+        if group_key not in adata.obs.columns:
+            raise ValueError(f"{group_key!r} missing from adata_by_sample[{sample!r}].obs")
+        labels = _valid_group_series(adata, group_key=group_key)
+        is_wm = labels.astype(str).str.contains(
+            wm_pattern, case=False, regex=True, na=False
+        ).to_numpy()
+        label_valid = labels.notna().to_numpy()
+        A, G = _get_count_layers(adata)
+        for site in recurrent_sites:
+            if site not in adata.var_names:
+                continue
+            j = adata.var_names.get_loc(site)
+            a = _dense_col(A, j).astype(float)
+            g = _dense_col(G, j).astype(float)
+            valid = label_valid & ((a + g) >= float(min_cov))
+            wm_mask = valid & is_wm
+            nonwm_mask = valid & ~is_wm
+            n_wm = int(wm_mask.sum())
+            n_nonwm = int(nonwm_mask.sum())
+            wm_a = int(np.rint(a[wm_mask].sum()))
+            wm_g = int(np.rint(g[wm_mask].sum()))
+            nonwm_a = int(np.rint(a[nonwm_mask].sum()))
+            nonwm_g = int(np.rint(g[nonwm_mask].sum()))
+            sufficient = n_wm >= int(min_spots_per_group) and n_nonwm >= int(
+                min_spots_per_group
+            )
+            odds_ratio = fisher_p = log2fc = np.nan
+            if sufficient and (wm_a + wm_g) > 0 and (nonwm_a + nonwm_g) > 0:
+                odds_ratio, fisher_p = fisher_exact(
+                    [[wm_g, wm_a], [nonwm_g, nonwm_a]], alternative="greater"
+                )
+                log2fc = float(np.log2(
+                    ((wm_g + pseudocount) / (wm_a + pseudocount))
+                    / ((nonwm_g + pseudocount) / (nonwm_a + pseudocount))
+                ))
+            rows.append({
+                "site": site,
+                "sample_id": sample,
+                "n_wm_spots": n_wm,
+                "n_nonwm_spots": n_nonwm,
+                "wm_A": wm_a,
+                "wm_G": wm_g,
+                "nonwm_A": nonwm_a,
+                "nonwm_G": nonwm_g,
+                "wm_g_over_a": ((wm_g + pseudocount) / (wm_a + pseudocount)),
+                "nonwm_g_over_a": ((nonwm_g + pseudocount) / (nonwm_a + pseudocount)),
+                "fisher_odds_ratio": float(odds_ratio) if np.isfinite(odds_ratio) else odds_ratio,
+                "log2fc": log2fc,
+                "fisher_p": float(fisher_p) if np.isfinite(fisher_p) else fisher_p,
+                "support_ok": sufficient,
+            })
+
+    result = pd.DataFrame(rows)
+    result["fisher_fdr_within_slice"] = np.nan
+    for _, index in result.groupby("sample_id").groups.items():
+        valid_index = result.loc[index].index[result.loc[index, "fisher_p"].notna()]
+        if len(valid_index):
+            result.loc[valid_index, "fisher_fdr_within_slice"] = multipletests(
+                result.loc[valid_index, "fisher_p"].to_numpy(float), method="fdr_bh"
+            )[1]
+    result["candidate_raw_p"] = (
+        result["support_ok"]
+        & result["fisher_p"].lt(float(alpha))
+        & result["log2fc"].gt(float(min_log2fc))
+    )
+    result["candidate_fdr"] = (
+        result["support_ok"]
+        & result["fisher_fdr_within_slice"].lt(float(alpha))
+        & result["log2fc"].gt(float(min_log2fc))
+    )
+    return result.sort_values(
+        ["candidate_raw_p", "sample_id", "fisher_p", "log2fc"],
+        ascending=[False, True, True, False], na_position="last"
+    ).reset_index(drop=True)
+
+
+def _fit_grouped_binomial_glm(g, a, design, term_names):
+    """Fit grouped A/G binomial counts and return fit plus spot-level dispersion."""
+    g = np.asarray(g, dtype=float)
+    a = np.asarray(a, dtype=float)
+    design = np.asarray(design, dtype=float)
+    if design.ndim != 2 or design.shape[1] != len(term_names):
+        raise ValueError("Grouped-binomial design and term_names do not match.")
+    if len(g) != len(a) or len(g) != design.shape[0]:
+        raise ValueError("Grouped-binomial inputs have incompatible lengths.")
+    if np.any(g < 0) or np.any(a < 0) or np.any((g + a) <= 0):
+        raise ValueError("Grouped-binomial counts must be nonnegative with positive totals.")
+    fit = sm.GLM(
+        np.column_stack([g, a]),
+        design,
+        family=sm.families.Binomial(),
+    ).fit(maxiter=200, disp=0)
+    if not getattr(fit, "converged", True):
+        raise RuntimeError("Grouped-binomial GLM did not converge.")
+    pearson = float(np.sum(np.asarray(fit.resid_pearson, dtype=float) ** 2))
+    dispersion = max(1.0, pearson / max(int(fit.df_resid), 1))
+    return fit, dispersion
+
+
+def _nested_count_model_row(reduced_fit, full_fit, dispersion, prefix):
+    statistic = max(0.0, 2.0 * (float(full_fit.llf) - float(reduced_fit.llf)))
+    df = max(1, int(full_fit.df_model - reduced_fit.df_model))
+    return {
+        f"{prefix}_lrt": statistic,
+        f"{prefix}_df": df,
+        f"{prefix}_binomial_p": float(chi2.sf(statistic, df)),
+        f"{prefix}_dispersion_adjusted_p": float(chi2.sf(statistic / dispersion, df)),
+    }
+
+
+def fit_global_atoi_count_joint_model(
+    site_table: pd.DataFrame,
+    covariates_by_sample: dict,
+    adata_by_sample: Optional[dict] = None,
+    data_root: Optional[Union[str, Path]] = None,
+    sample_ids: Sequence[str] = ("151673", "151671", "151507"),
+    sample_col: str = "Slice",
+    site_col: str = "site",
+    celltype_cols: Sequence[str] = (
+        "celltype_glial_module", "celltype_excitatory_module"
+    ),
+    adar_cols: Sequence[str] = ("expr_ADAR_family_score",),
+    group_key: str = "ground_truth",
+    min_total_cov: int = 20,
+):
+    """Fit a pooled spot-level global A-to-I A/G count model.
+
+    A fixed set of global sites shared by every requested slice is used. A and
+    G reads are summed over that set within each spot. Three nested grouped
+    binomial models are then compared: slice-only, slice + cell-type modules,
+    and slice + cell-type modules + ADAR. Spatial x/y terms are deliberately
+    excluded so this model addresses biological composition rather than
+    spatial discovery. Pearson-dispersion-adjusted p values are reported next
+    to ordinary binomial likelihood-ratio p values.
+    """
+    samples = [str(x) for x in sample_ids]
+    celltype_cols = list(celltype_cols)
+    adar_cols = list(adar_cols)
+    required_site_cols = {sample_col, site_col}
+    missing = required_site_cols.difference(site_table.columns)
+    if missing:
+        raise ValueError(f"site_table is missing required columns: {sorted(missing)}")
+    if min_total_cov < 1:
+        raise ValueError("min_total_cov must be positive.")
+
+    sites_df = site_table.copy()
+    sites_df[sample_col] = sites_df[sample_col].astype(str)
+    sites_df[site_col] = sites_df[site_col].astype(str)
+    site_sets = [set(sites_df.loc[sites_df[sample_col].eq(s), site_col]) for s in samples]
+    common_sites = sorted(set.intersection(*site_sets))
+    if not common_sites:
+        raise ValueError("No global A-to-I site is shared by all requested slices.")
+
+    if adata_by_sample is None:
+        if data_root is None:
+            raise ValueError("Provide adata_by_sample or data_root.")
+        import anndata as ad
+        root = Path(data_root)
+        adata_by_sample = {
+            sample: ad.read_h5ad(root / sample / "adata_ai.h5ad")
+            for sample in samples
+        }
+
+    frames = []
+    for sample in samples:
+        if sample not in adata_by_sample:
+            raise ValueError(f"adata_by_sample has no entry for {sample!r}.")
+        if sample not in covariates_by_sample:
+            raise ValueError(
+                f"covariates_by_sample has no entry for {sample!r}; run each slice section first."
+            )
+        adata = adata_by_sample[sample]
+        available = [s for s in common_sites if s in adata.var_names]
+        if len(available) != len(common_sites):
+            missing_n = len(common_sites) - len(available)
+            raise ValueError(f"{sample} is missing {missing_n} shared global sites in adata.var_names.")
+        indexer = adata.var_names.get_indexer(available)
+        A, G = _get_count_layers(adata)
+        total_a = _dense_sum(A[:, indexer], axis=1)
+        total_g = _dense_sum(G[:, indexer], axis=1)
+
+        cov = covariates_by_sample[sample].copy()
+        cov.index = cov.index.astype(str)
+        required_cov = set(celltype_cols + adar_cols)
+        missing_cov = required_cov.difference(cov.columns)
+        if missing_cov:
+            raise ValueError(
+                f"covariates_by_sample[{sample!r}] is missing: {sorted(missing_cov)}"
+            )
+        frame = cov.reindex(adata.obs_names.astype(str)).copy()
+        frame["A"] = total_a
+        frame["G"] = total_g
+        frame["total"] = total_a + total_g
+        frame["sample_id"] = sample
+        if group_key not in frame.columns and group_key in adata.obs.columns:
+            frame[group_key] = adata.obs[group_key].to_numpy()
+        frames.append(frame)
+
+    spot_df = pd.concat(frames, axis=0)
+    spot_df.index.name = "spot"
+    model_predictors = celltype_cols + adar_cols
+    for col in model_predictors:
+        spot_df[col] = pd.to_numeric(spot_df[col], errors="coerce")
+    spot_df = spot_df.replace([np.inf, -np.inf], np.nan)
+    spot_df = spot_df.loc[spot_df["total"].ge(float(min_total_cov))].copy()
+    spot_df = spot_df.dropna(subset=["A", "G"] + model_predictors)
+    if spot_df.empty:
+        raise ValueError("No spots remain for the global A/G count model.")
+
+    zcols = []
+    for col in model_predictors:
+        zcol = f"{col}__within_slice_z"
+        zcols.append(zcol)
+        centered = spot_df[col] - spot_df.groupby("sample_id")[col].transform("mean")
+        scale = spot_df.groupby("sample_id")[col].transform("std")
+        scale = scale.where(scale.gt(1e-12), 1.0)
+        spot_df[zcol] = centered / scale
+
+    sample_cat = pd.Categorical(spot_df["sample_id"], categories=samples, ordered=True)
+    slice_dummies = pd.get_dummies(sample_cat, prefix="slice", drop_first=True, dtype=float)
+    slice_dummies.index = spot_df.index
+    base_names = ["const"] + slice_dummies.columns.tolist()
+    base = np.column_stack([
+        np.ones(len(spot_df), dtype=float), slice_dummies.to_numpy(float)
+    ])
+    cell_z = [f"{c}__within_slice_z" for c in celltype_cols]
+    adar_z = [f"{c}__within_slice_z" for c in adar_cols]
+    x_cell = np.column_stack([base, spot_df[cell_z].to_numpy(float)])
+    x_full = np.column_stack([x_cell, spot_df[adar_z].to_numpy(float)])
+    cell_names = base_names + celltype_cols
+    full_names = cell_names + adar_cols
+
+    null_fit, _ = _fit_grouped_binomial_glm(
+        spot_df["G"], spot_df["A"], base, base_names
+    )
+    cell_fit, _ = _fit_grouped_binomial_glm(
+        spot_df["G"], spot_df["A"], x_cell, cell_names
+    )
+    full_fit, full_dispersion = _fit_grouped_binomial_glm(
+        spot_df["G"], spot_df["A"], x_full, full_names
+    )
+
+    null_dev = float(null_fit.deviance)
+    cell_dev = float(cell_fit.deviance)
+    full_dev = float(full_fit.deviance)
+    denom = null_dev if null_dev > 0 else np.nan
+    summary = {
+        "model_family": "grouped_binomial_logit",
+        "primary_p_method": "pearson_dispersion_adjusted_lrt",
+        "n_samples": len(samples),
+        "n_spots": int(len(spot_df)),
+        "n_common_global_sites": int(len(common_sites)),
+        "min_total_cov": int(min_total_cov),
+        "celltype_terms": ", ".join(celltype_cols),
+        "adar_terms": ", ".join(adar_cols),
+        "spatial_xy_included": False,
+        "pearson_dispersion": full_dispersion,
+        "null_deviance": null_dev,
+        "celltype_deviance": cell_dev,
+        "joint_deviance": full_dev,
+        "celltype_deviance_fraction": (null_dev - cell_dev) / denom,
+        "adar_increment_deviance_fraction": (cell_dev - full_dev) / denom,
+        "joint_deviance_explained": (null_dev - full_dev) / denom,
+        "unexplained_deviance_fraction": full_dev / denom,
+    }
+    summary.update(_nested_count_model_row(
+        null_fit, cell_fit, full_dispersion, "celltype_vs_slice"
+    ))
+    summary.update(_nested_count_model_row(
+        cell_fit, full_fit, full_dispersion, "adar_increment"
+    ))
+    summary_df = pd.DataFrame([summary])
+
+    coef = np.asarray(full_fit.params, dtype=float)
+    se = np.asarray(full_fit.bse, dtype=float)
+    coef_df = pd.DataFrame({
+        "term": full_names,
+        "coef_log_odds": coef,
+        "odds_ratio": np.exp(np.clip(coef, -30, 30)),
+        "binomial_se": se,
+        "binomial_p": np.asarray(full_fit.pvalues, dtype=float),
+        "dispersion_adjusted_se": se * np.sqrt(full_dispersion),
+    })
+    z_scaled = coef_df["coef_log_odds"] / coef_df["dispersion_adjusted_se"]
+    coef_df["dispersion_adjusted_p"] = 2.0 * norm.sf(np.abs(z_scaled))
+    coef_df["dispersion_adjusted_fdr"] = _safe_multipletest(
+        coef_df["dispersion_adjusted_p"]
+    )
+
+    spot_df["observed_global_ratio"] = spot_df["G"] / spot_df["total"]
+    spot_df["predicted_global_ratio"] = np.asarray(full_fit.predict(x_full), dtype=float)
+    cluster_rows = []
+    if group_key in spot_df.columns:
+        for (sample, group), sub in spot_df.dropna(subset=[group_key]).groupby(
+            ["sample_id", group_key], observed=True
+        ):
+            cluster_rows.append({
+                "sample_id": str(sample),
+                "group": group,
+                "n_spots": int(len(sub)),
+                "A": float(sub["A"].sum()),
+                "G": float(sub["G"].sum()),
+                "observed_global_ratio": float(sub["G"].sum() / sub["total"].sum()),
+                "predicted_global_ratio": float(
+                    np.average(sub["predicted_global_ratio"], weights=sub["total"])
+                ),
+            })
+    cluster_df = pd.DataFrame(cluster_rows)
+    spot_out = spot_df.reset_index()
+    spot_out.attrs["common_global_sites"] = common_sites
+    return summary_df, coef_df, spot_out, cluster_df
+
+
+def plot_global_count_joint_cluster_summary(
+    cluster_df: pd.DataFrame,
+    sample_col: str = "sample_id",
+    group_col: str = "group",
+    observed_col: str = "observed_global_ratio",
+    predicted_col: str = "predicted_global_ratio",
+    figsize=(13.0, 4.2),
+    title: str = "Global A-to-I count model: observed and predicted cluster ratios",
+):
+    """Plot cluster-level summaries from the spot-level global count model."""
+    required = {sample_col, group_col, observed_col, predicted_col}
+    missing = required.difference(cluster_df.columns)
+    if missing:
+        raise ValueError(f"cluster_df is missing required columns: {sorted(missing)}")
+    samples = cluster_df[sample_col].astype(str).drop_duplicates().tolist()
+    fig, axes = plt.subplots(1, len(samples), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+    plot_rows = []
+    for ax, sample in zip(axes, samples):
+        sub = cluster_df.loc[cluster_df[sample_col].astype(str).eq(sample)].copy()
+        sub[group_col] = sub[group_col].astype(str)
+        sub["_order"] = sub[group_col].map(
+            lambda x: (1, 99, x) if x.upper() == "WM" else (
+                0,
+                int(re.search(r"(\d+)", x).group(1)) if re.search(r"(\d+)", x) else 98,
+                x,
+            )
+        )
+        sub = sub.sort_values("_order")
+        x = np.arange(len(sub), dtype=float)
+        width = 0.38
+        ax.bar(x - width / 2, sub[observed_col], width=width,
+               color="#4C78A8", label="Observed")
+        ax.bar(x + width / 2, sub[predicted_col], width=width,
+               color="#F58518", label="Predicted")
+        ax.set_xticks(x)
+        ax.set_xticklabels(sub[group_col], rotation=45, ha="right")
+        ax.set_title(str(sample))
+        ax.set_ylabel("Global G / (A + G)")
+        ax.spines[["top", "right"]].set_visible(False)
+        plot_rows.extend(sub.drop(columns="_order").to_dict("records"))
+    axes[0].legend(frameon=False)
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    return fig, axes, pd.DataFrame(plot_rows)
+
+
+def analyze_recurrent_sv_wm_binomial(
+    sv_calls: pd.DataFrame,
+    adata_by_sample: Optional[dict] = None,
+    data_root: Optional[Union[str, Path]] = None,
+    sample_ids: Sequence[str] = ("151673", "151671", "151507"),
+    sample_col: str = "Slice",
+    site_col: str = "site",
+    call_col: str = "is_sv_atoi",
+    group_key: str = "ground_truth",
+    wm_pattern: str = r"(?:^WM$|white)",
+    min_cov: int = 5,
+    min_spots_per_group: int = 1,
+    alpha: float = 0.05,
+):
+    """Run coherent single-slice and pooled three-slice WM binomial tests.
+
+    Recurrent sites are those called as SV-A-to-I in every requested slice.
+    Single-slice models use ``logit(p) = intercept + WM``. The pooled model
+    uses ``logit(p) = slice + WM``; a nested slice-specific-WM model tests
+    heterogeneity. No x/y terms are included because this analysis targets the
+    anatomical WM contrast itself. Ordinary and Pearson-dispersion-adjusted
+    likelihood-ratio p values are both returned.
+    """
+    samples = [str(x) for x in sample_ids]
+    required = {sample_col, site_col, call_col}
+    missing = required.difference(sv_calls.columns)
+    if missing:
+        raise ValueError(f"sv_calls is missing required columns: {sorted(missing)}")
+    calls = sv_calls.copy()
+    calls[sample_col] = calls[sample_col].astype(str)
+    calls[site_col] = calls[site_col].astype(str)
+    calls = calls.loc[calls[call_col].fillna(False).astype(bool)]
+    site_sets = [set(calls.loc[calls[sample_col].eq(s), site_col]) for s in samples]
+    recurrent_sites = sorted(set.intersection(*site_sets))
+    if not recurrent_sites:
+        raise ValueError("No called SV-A-to-I site is shared by all requested slices.")
+
+    if adata_by_sample is None:
+        if data_root is None:
+            raise ValueError("Provide adata_by_sample or data_root.")
+        import anndata as ad
+        root = Path(data_root)
+        adata_by_sample = {}
+        for sample in samples:
+            adata = ad.read_h5ad(root / sample / "adata_ai.h5ad")
+            label_path = root / sample / f"cluster_labels_{sample}.csv"
+            labels = pd.read_csv(label_path)
+            labels["barcode"] = labels["key"].astype(str).str.split("_", n=1).str[-1]
+            adata.obs[group_key] = labels.set_index("barcode")[group_key].reindex(
+                adata.obs_names
+            ).to_numpy()
+            adata_by_sample[sample] = adata
+
+    per_rows = []
+    frames_by_site = {site: [] for site in recurrent_sites}
+    for sample in samples:
+        adata = adata_by_sample[sample]
+        labels = _valid_group_series(adata, group_key=group_key)
+        is_wm = labels.astype(str).str.contains(
+            wm_pattern, case=False, regex=True, na=False
+        ).to_numpy()
+        label_valid = labels.notna().to_numpy()
+        A, G = _get_count_layers(adata)
+        for site in recurrent_sites:
+            if site not in adata.var_names:
+                continue
+            j = adata.var_names.get_loc(site)
+            a = _dense_col(A, j).astype(float)
+            g = _dense_col(G, j).astype(float)
+            valid = label_valid & ((a + g) >= float(min_cov))
+            frame = pd.DataFrame({
+                "A": a[valid], "G": g[valid], "is_wm": is_wm[valid],
+                "sample_id": sample,
+            })
+            frames_by_site[site].append(frame)
+            wm = frame["is_wm"].to_numpy(bool)
+            n_wm = int(wm.sum())
+            n_nonwm = int((~wm).sum())
+            wm_a = float(frame.loc[wm, "A"].sum())
+            wm_g = float(frame.loc[wm, "G"].sum())
+            nonwm_a = float(frame.loc[~wm, "A"].sum())
+            nonwm_g = float(frame.loc[~wm, "G"].sum())
+            sufficient = n_wm >= min_spots_per_group and n_nonwm >= min_spots_per_group
+            row = {
+                "site": site, "sample_id": sample,
+                "n_wm_spots": n_wm, "n_nonwm_spots": n_nonwm,
+                "wm_A": wm_a, "wm_G": wm_g,
+                "nonwm_A": nonwm_a, "nonwm_G": nonwm_g,
+                "support_ok": sufficient, "fit_status": "insufficient_support",
+                "wm_log_odds": np.nan, "wm_log2fc": np.nan,
+                "wm_odds_ratio": np.nan, "binomial_lrt": np.nan,
+                "binomial_p": np.nan, "pearson_dispersion": np.nan,
+                "dispersion_adjusted_p": np.nan,
+            }
+            if sufficient:
+                try:
+                    x0 = np.ones((len(frame), 1), dtype=float)
+                    x1 = np.column_stack([x0, frame["is_wm"].to_numpy(float)])
+                    fit0, _ = _fit_grouped_binomial_glm(frame["G"], frame["A"], x0, ["const"])
+                    fit1, dispersion = _fit_grouped_binomial_glm(
+                        frame["G"], frame["A"], x1, ["const", "WM"]
+                    )
+                    lrt = max(0.0, 2.0 * (float(fit1.llf) - float(fit0.llf)))
+                    beta = float(fit1.params[-1])
+                    row.update({
+                        "fit_status": "ok", "wm_log_odds": beta,
+                        "wm_log2fc": beta / np.log(2.0),
+                        "wm_odds_ratio": float(np.exp(np.clip(beta, -30, 30))),
+                        "binomial_lrt": lrt,
+                        "binomial_p": float(chi2.sf(lrt, 1)),
+                        "pearson_dispersion": dispersion,
+                        "dispersion_adjusted_p": float(chi2.sf(lrt / dispersion, 1)),
+                    })
+                except Exception:
+                    row["fit_status"] = "fit_failed"
+            per_rows.append(row)
+
+    per_slice = pd.DataFrame(per_rows)
+    for pcol, fdr_col in [
+        ("binomial_p", "binomial_fdr_within_slice"),
+        ("dispersion_adjusted_p", "dispersion_adjusted_fdr_within_slice"),
+    ]:
+        per_slice[fdr_col] = np.nan
+        for _, index in per_slice.groupby("sample_id").groups.items():
+            valid_index = per_slice.loc[index].index[per_slice.loc[index, pcol].notna()]
+            if len(valid_index):
+                per_slice.loc[valid_index, fdr_col] = multipletests(
+                    per_slice.loc[valid_index, pcol].to_numpy(float), method="fdr_bh"
+                )[1]
+    per_slice["binomial_candidate"] = (
+        per_slice["binomial_fdr_within_slice"].lt(alpha)
+        & per_slice["wm_log_odds"].gt(0)
+    )
+    per_slice["dispersion_adjusted_candidate"] = (
+        per_slice["dispersion_adjusted_fdr_within_slice"].lt(alpha)
+        & per_slice["wm_log_odds"].gt(0)
+    )
+
+    pooled_rows = []
+    for site in recurrent_sites:
+        pieces = frames_by_site.get(site, [])
+        if not pieces:
+            continue
+        frame = pd.concat(pieces, ignore_index=True)
+        sample_cat = pd.Categorical(frame["sample_id"], categories=samples, ordered=True)
+        dummies = pd.get_dummies(sample_cat, prefix="slice", drop_first=True, dtype=float)
+        base = np.column_stack([np.ones(len(frame)), dummies.to_numpy(float)])
+        base_names = ["const"] + dummies.columns.tolist()
+        wm = frame["is_wm"].to_numpy(float)
+        support_samples = []
+        directions = []
+        for sample in samples:
+            sub = frame.loc[frame["sample_id"].eq(sample)]
+            has_both = sub["is_wm"].any() and (~sub["is_wm"]).any()
+            if has_both:
+                support_samples.append(sample)
+                wm_g = float(sub.loc[sub["is_wm"], "G"].sum())
+                wm_a = float(sub.loc[sub["is_wm"], "A"].sum())
+                nw_g = float(sub.loc[~sub["is_wm"], "G"].sum())
+                nw_a = float(sub.loc[~sub["is_wm"], "A"].sum())
+                odds = ((wm_g + 0.5) / (wm_a + 0.5)) / ((nw_g + 0.5) / (nw_a + 0.5))
+                directions.append(odds > 1.0)
+        row = {
+            "site": site,
+            "n_spots": int(len(frame)),
+            "n_wm_spots": int(frame["is_wm"].sum()),
+            "n_nonwm_spots": int((~frame["is_wm"]).sum()),
+            "n_slices_with_both_regions": len(support_samples),
+            "all_supported_slices_positive": bool(directions) and all(directions),
+            "fit_status": "insufficient_support",
+            "wm_log_odds": np.nan, "wm_log2fc": np.nan,
+            "wm_odds_ratio": np.nan, "pooled_binomial_lrt": np.nan,
+            "pooled_binomial_p": np.nan, "pearson_dispersion": np.nan,
+            "pooled_dispersion_adjusted_p": np.nan,
+            "heterogeneity_lrt": np.nan, "heterogeneity_df": np.nan,
+            "heterogeneity_p": np.nan,
+        }
+        if len(support_samples) >= 1:
+            try:
+                fit0, _ = _fit_grouped_binomial_glm(
+                    frame["G"], frame["A"], base, base_names
+                )
+                common_x = np.column_stack([base, wm])
+                fit1, dispersion = _fit_grouped_binomial_glm(
+                    frame["G"], frame["A"], common_x, base_names + ["WM"]
+                )
+                lrt = max(0.0, 2.0 * (float(fit1.llf) - float(fit0.llf)))
+                beta = float(fit1.params[-1])
+                row.update({
+                    "fit_status": "ok", "wm_log_odds": beta,
+                    "wm_log2fc": beta / np.log(2.0),
+                    "wm_odds_ratio": float(np.exp(np.clip(beta, -30, 30))),
+                    "pooled_binomial_lrt": lrt,
+                    "pooled_binomial_p": float(chi2.sf(lrt, 1)),
+                    "pearson_dispersion": dispersion,
+                    "pooled_dispersion_adjusted_p": float(chi2.sf(lrt / dispersion, 1)),
+                })
+                if len(support_samples) >= 2:
+                    wm_by_slice = np.column_stack([
+                        wm * frame["sample_id"].eq(sample).to_numpy(float)
+                        for sample in support_samples
+                    ])
+                    heter_x = np.column_stack([base, wm_by_slice])
+                    heter_names = base_names + [f"WM:{s}" for s in support_samples]
+                    fit2, _ = _fit_grouped_binomial_glm(
+                        frame["G"], frame["A"], heter_x, heter_names
+                    )
+                    heter_lrt = max(0.0, 2.0 * (float(fit2.llf) - float(fit1.llf)))
+                    heter_df = len(support_samples) - 1
+                    row.update({
+                        "heterogeneity_lrt": heter_lrt,
+                        "heterogeneity_df": heter_df,
+                        "heterogeneity_p": float(chi2.sf(heter_lrt, heter_df)),
+                    })
+            except Exception:
+                row["fit_status"] = "fit_failed"
+        pooled_rows.append(row)
+
+    pooled = pd.DataFrame(pooled_rows)
+    for pcol, fdr_col in [
+        ("pooled_binomial_p", "pooled_binomial_fdr"),
+        ("pooled_dispersion_adjusted_p", "pooled_dispersion_adjusted_fdr"),
+        ("heterogeneity_p", "heterogeneity_fdr"),
+    ]:
+        pooled[fdr_col] = np.nan
+        valid = pooled[pcol].notna()
+        if valid.any():
+            pooled.loc[valid, fdr_col] = multipletests(
+                pooled.loc[valid, pcol].to_numpy(float), method="fdr_bh"
+            )[1]
+    pooled["pooled_binomial_candidate"] = (
+        pooled["pooled_binomial_fdr"].lt(alpha) & pooled["wm_log_odds"].gt(0)
+    )
+    pooled["pooled_dispersion_adjusted_candidate"] = (
+        pooled["pooled_dispersion_adjusted_fdr"].lt(alpha)
+        & pooled["wm_log_odds"].gt(0)
+    )
+    pooled = pooled.sort_values(
+        ["pooled_dispersion_adjusted_candidate", "pooled_dispersion_adjusted_fdr",
+         "pooled_binomial_fdr"],
+        ascending=[False, True, True], na_position="last"
+    ).reset_index(drop=True)
+    return per_slice, pooled
 
 
 def plot_cross_sample_recurrent_site_cluster_ratios(
