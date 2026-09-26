@@ -767,7 +767,7 @@ def select_atoi_score_sites(
     adata_ai=None,
     require_sv: bool = True,
     fallback_to_ranked: bool = True,
-    top_n: int = 200,
+    top_n: Optional[int] = None,
     min_moran_I: float = 0.0,
 ):
     """
@@ -852,7 +852,7 @@ def compute_sv_atoi_score(
     sv_atoi: pd.DataFrame,
     score_name: str = "sv_atoi_score",
     min_cov: int = 10,
-    top_n: int = 200,
+    top_n: Optional[int] = None,
     weight_col: str = "moran_I",
     require_sv: bool = True,
     fallback_to_ranked: bool = True,
@@ -1829,20 +1829,6 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
         showfliers=False,
         ax=ax,
     )
-    sns.stripplot(
-        data=plot_points,
-        x=sample_col,
-        y=value_col,
-        hue=region_col,
-        hue_order=["non-WM", "WM"],
-        dodge=True,
-        palette={"non-WM": "#4d4d4d", "WM": "#8c2d04"},
-        size=2.5,
-        alpha=0.45,
-        linewidth=0,
-        ax=ax,
-    )
-
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(handles[:2], labels[:2], frameon=False, title="")
@@ -1894,7 +1880,8 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
         ax.set_ylim(max(0, y_lower - 0.05 * span), min(1, y_upper + 0.16 * span))
     plt.tight_layout()
 
-    df["shown_in_stripplot"] = df.index.isin(plot_points.index)
+    # Intentionally show boxes only: no raw/sample points and no fliers.
+    df["shown_in_stripplot"] = False
     return fig, ax, df
 
 
@@ -2180,16 +2167,15 @@ def plot_cross_sample_recurrent_site_cluster_ratios(
 
     fig, axes = plt.subplots(1, len(samples), figsize=figsize, squeeze=False)
     axes = axes.ravel()
-    color_artist = None
     for ax, sample in zip(axes, samples):
         adata, values = mapped[sample]
         color_artist = _spatial_axes(
             ax, adata, values.to_numpy(float), str(sample), cmap=cmap,
             spot_size=spot_size, vmin=vmin, vmax=vmax,
         )
-    if color_artist is not None:
-        fig.colorbar(color_artist, ax=list(axes), fraction=0.025, pad=0.02,
-                     label="Cluster mean A-to-I ratio")
+        if color_artist is not None:
+            cbar = fig.colorbar(color_artist, ax=ax, fraction=0.046, pad=0.02)
+            cbar.set_label("Cluster mean A-to-I ratio")
     fig.suptitle(title or f"Recurrent SV-A-to-I site {site}: cluster-level spatial maps",
                  fontsize=13, y=1.02)
     fig.tight_layout()
@@ -4962,7 +4948,7 @@ def detect_spatial_atoi_sites_counts(
 def plot_count_spatial_discovery(sv_atoi, figsize=(14.5, 4.2)):
     """Plot discovery counts plus significance/effect and coverage diagnostics."""
     required = {"pass_qc", "is_sv_atoi", "spatial_effect", "spatial_p",
-                "total_cov_valid"}
+                "total_cov_valid", "mean_ratio"}
     missing = sorted(required.difference(sv_atoi.columns))
     if missing:
         raise ValueError(f"sv_atoi is missing required columns: {missing}")
@@ -4983,37 +4969,46 @@ def plot_count_spatial_discovery(sv_atoi, figsize=(14.5, 4.2)):
                     xytext=(0, 4), textcoords="offset points", ha="center", va="bottom")
 
     ax = axes[1]
-    plot_df = df.loc[np.isfinite(df["spatial_p"]) &
-                     np.isfinite(df["spatial_effect"])].copy()
-    plot_df["minus_log10_p"] = -np.log10(
-        plot_df["spatial_p"].astype(float).clip(lower=np.finfo(float).tiny)
+    mean_ratio = pd.to_numeric(df["mean_ratio"], errors="coerce")
+    pvalue = pd.to_numeric(df["spatial_p"], errors="coerce")
+    fitted = np.isfinite(pvalue)
+    minus_log10_p = pd.Series(0.0, index=df.index)
+    minus_log10_p.loc[fitted] = -np.log10(
+        pvalue.loc[fitted].clip(lower=np.finfo(float).tiny)
     )
-    selected = called.loc[plot_df.index]
-    ax.scatter(plot_df.loc[~selected, "spatial_effect"],
-               plot_df.loc[~selected, "minus_log10_p"], s=20,
-               color="#9e9e9e", alpha=0.65, linewidth=0, label="not called")
-    ax.scatter(plot_df.loc[selected, "spatial_effect"],
-               plot_df.loc[selected, "minus_log10_p"], s=28,
+    visible = np.isfinite(mean_ratio)
+    ax.scatter(mean_ratio[visible & ~fitted], minus_log10_p[visible & ~fitted],
+               s=9, color="#d9d9d9", alpha=0.45, linewidth=0,
+               label=f"not fitted/QC fail (n={(visible & ~fitted).sum()})", rasterized=True)
+    ax.scatter(mean_ratio[visible & fitted & ~called],
+               minus_log10_p[visible & fitted & ~called], s=18,
+               color="#8c8c8c", alpha=0.65, linewidth=0,
+               label=f"fitted, not called (n={(visible & fitted & ~called).sum()})",
+               rasterized=True)
+    ax.scatter(mean_ratio[visible & called], minus_log10_p[visible & called], s=25,
                color="#59a14f", alpha=0.9, linewidth=0, label="SV-A-to-I")
     if "p_cutoff" in df.columns:
         cutoffs = pd.to_numeric(df["p_cutoff"], errors="coerce").dropna()
         if not cutoffs.empty and cutoffs.iloc[0] > 0:
             ax.axhline(-np.log10(cutoffs.iloc[0]), color="#d62728", ls="--", lw=1)
-    ax.set(xlabel="Spatial effect (P95 - P5)", ylabel="-log10(spatial p)",
+    ax.set(xlabel="Mean editing ratio across valid spots", ylabel="-log10(spatial p)",
            title="Spatial count regression")
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[2]
     cov = pd.to_numeric(df["total_cov_valid"], errors="coerce")
-    effect = pd.to_numeric(df["spatial_effect"], errors="coerce")
-    valid = np.isfinite(cov) & (cov > 0) & np.isfinite(effect)
-    ax.scatter(cov[valid & ~called], effect[valid & ~called], s=20,
-               color="#9e9e9e", alpha=0.6, linewidth=0)
-    ax.scatter(cov[valid & called], effect[valid & called], s=28,
-               color="#59a14f", alpha=0.9, linewidth=0)
+    raw_effect = pd.to_numeric(df["spatial_effect"], errors="coerce")
+    effect = raw_effect.fillna(0.0)
+    valid = np.isfinite(cov) & (cov > 0)
+    ax.scatter(cov[valid & ~fitted], effect[valid & ~fitted], s=9,
+               color="#d9d9d9", alpha=0.45, linewidth=0, rasterized=True)
+    ax.scatter(cov[valid & fitted & ~called], effect[valid & fitted & ~called], s=18,
+               color="#8c8c8c", alpha=0.6, linewidth=0, rasterized=True)
+    ax.scatter(cov[valid & called], effect[valid & called], s=25,
+               color="#59a14f", alpha=0.9, linewidth=0, rasterized=True)
     ax.set_xscale("log")
     ax.set(xlabel="Total coverage across valid spots (log scale)",
-           ylabel="Spatial effect (P95 - P5)",
+           ylabel="Spatial effect (P95 - P5; 0 = not fitted)",
            title="Coverage and spatial effect")
     fig.tight_layout()
     return fig, axes
