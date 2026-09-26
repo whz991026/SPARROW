@@ -1795,9 +1795,10 @@ def plot_cross_sample_recurrent_site_wm_boxplot(
                 continue
             q1, q3 = values.quantile([0.25, 0.75])
             iqr = q3 - q1
-            # Keep the display close to the boxes.  Boxplot whiskers and all
-            # statistics are still computed from the complete, untrimmed data.
-            pad = min(float(whisker_iqr), max(0.0, float(display_box_pad_iqr)))
+            # Match the displayed boxplot whiskers exactly. Values beyond the
+            # Tukey whiskers remain in the statistics but are not drawn and do
+            # not determine the y-axis range.
+            pad = max(0.0, float(whisker_iqr))
             lower = max(float(values.min()), float(q1 - pad * iqr))
             upper = min(float(values.max()), float(q3 + pad * iqr))
             display_bounds.append((lower, upper))
