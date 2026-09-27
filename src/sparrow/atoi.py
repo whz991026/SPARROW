@@ -1812,11 +1812,19 @@ def plot_wm_aware_sv_volcano(
     title: str = "WM-aware SV-A-to-I sites",
     figsize=(6.8, 5.2),
 ):
-    """Plot stable WM effects; boundary/separation estimates are excluded.
+    """Plot ranked, direction-aware significance for WM-aware SV-A-to-I tests.
 
-    Orange and blue require both FDR < ``alpha`` and absolute log2 odds ratio
-    above ``effect_threshold``. ``candidate_col`` is retained for API
-    compatibility but does not override these explicit volcano thresholds.
+    This function keeps its historical name so existing notebooks continue to
+    run, but it no longer draws a volcano plot.  The y coordinate is
+
+    ``sign(wm_log2FC) * -log10(FDR)``.
+
+    Consequently, site selection and colouring use only ``FDR < alpha``;
+    ``effect_col`` is used only to determine whether a site is WM-high
+    (positive) or non-WM-high (negative).  The legacy ``candidate_col``,
+    ``effect_threshold``, ``max_abs_effect`` and
+    ``exclude_zero_count_boundaries`` arguments are accepted for notebook/API
+    compatibility but do not affect the plot.
     """
     if wm_results is None or wm_results.empty:
         raise ValueError("wm_results is empty.")
@@ -1835,55 +1843,31 @@ def plot_wm_aware_sv_volcano(
     if plot_df.empty:
         raise ValueError("No finite WM effects and FDR values are available to plot.")
 
-    if effect_threshold <= 0:
-        raise ValueError("effect_threshold must be positive.")
-    if max_abs_effect <= effect_threshold:
-        raise ValueError("max_abs_effect must be greater than effect_threshold.")
-
-    count_columns = ["wm_A", "wm_G", "nonwm_A", "nonwm_G"]
-    present_count_columns = [column for column in count_columns if column in plot_df.columns]
-    zero_boundary = pd.Series(False, index=plot_df.index)
-    if exclude_zero_count_boundaries and present_count_columns:
-        count_frame = plot_df[present_count_columns].apply(
-            pd.to_numeric, errors="coerce"
-        )
-        zero_boundary = count_frame.le(0).any(axis=1)
-    extreme_effect = plot_df[effect_col].abs().gt(float(max_abs_effect))
-    plot_df["zero_count_boundary"] = zero_boundary.to_numpy(bool)
-    plot_df["extreme_effect_boundary"] = extreme_effect.to_numpy(bool)
-    plot_df["volcano_excluded"] = zero_boundary | extreme_effect
-    plot_df["volcano_exclusion_reason"] = ""
-    plot_df.loc[zero_boundary, "volcano_exclusion_reason"] = "zero_A_or_G_count"
-    plot_df.loc[extreme_effect, "volcano_exclusion_reason"] = "absolute_log2OR_above_limit"
-    plot_df.loc[zero_boundary & extreme_effect, "volcano_exclusion_reason"] = (
-        "zero_A_or_G_count;absolute_log2OR_above_limit"
-    )
-
     plot_df["minus_log10_fdr"] = -np.log10(
         plot_df[fdr_col].clip(lower=np.finfo(float).tiny)
     )
-    display_df = plot_df.loc[~plot_df["volcano_excluded"]].copy()
-    if display_df.empty:
-        raise ValueError("All finite WM effects were boundary or extreme estimates.")
+    effect_sign = np.sign(plot_df[effect_col].to_numpy(dtype=float))
+    plot_df["signed_significance"] = (
+        effect_sign * plot_df["minus_log10_fdr"].to_numpy(dtype=float)
+    )
+    plot_df = plot_df.sort_values(
+        ["signed_significance", fdr_col, site_col],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+    plot_df["significance_rank"] = np.arange(1, len(plot_df) + 1)
 
-    positive = (
-        display_df[fdr_col].lt(alpha)
-        & display_df[effect_col].gt(effect_threshold)
-    )
-    negative = (
-        display_df[fdr_col].lt(alpha)
-        & display_df[effect_col].lt(-effect_threshold)
-    )
+    positive = plot_df[fdr_col].lt(alpha) & plot_df[effect_col].gt(0)
+    negative = plot_df[fdr_col].lt(alpha) & plot_df[effect_col].lt(0)
     plot_df["wm_positive_significant"] = False
     plot_df["nonwm_positive_significant"] = False
-    plot_df.loc[display_df.index, "wm_positive_significant"] = positive.to_numpy(bool)
-    plot_df.loc[display_df.index, "nonwm_positive_significant"] = negative.to_numpy(bool)
+    plot_df.loc[positive, "wm_positive_significant"] = True
+    plot_df.loc[negative, "nonwm_positive_significant"] = True
 
     fig, ax = plt.subplots(figsize=figsize)
     background = ~(positive | negative)
     ax.scatter(
-        display_df.loc[background, effect_col],
-        display_df.loc[background, "minus_log10_fdr"],
+        plot_df.loc[background, "significance_rank"],
+        plot_df.loc[background, "signed_significance"],
         s=22,
         color="#bdbdbd",
         alpha=0.65,
@@ -1892,64 +1876,47 @@ def plot_wm_aware_sv_volcano(
     )
     if negative.any():
         ax.scatter(
-            display_df.loc[negative, effect_col],
-            display_df.loc[negative, "minus_log10_fdr"],
+            plot_df.loc[negative, "significance_rank"],
+            plot_df.loc[negative, "signed_significance"],
             s=30,
             color="#4e79a7",
             alpha=0.88,
             linewidths=0,
-            label=f"non-WM > WM, FDR < {alpha:g}, log2OR < -{effect_threshold:g}",
+            label=f"non-WM-high, FDR < {alpha:g}",
         )
     if positive.any():
         ax.scatter(
-            display_df.loc[positive, effect_col],
-            display_df.loc[positive, "minus_log10_fdr"],
+            plot_df.loc[positive, "significance_rank"],
+            plot_df.loc[positive, "signed_significance"],
             s=34,
             color="#d95f02",
             alpha=0.92,
             linewidths=0,
-            label=f"WM > non-WM, FDR < {alpha:g}, log2OR > {effect_threshold:g}",
+            label=f"WM-high, FDR < {alpha:g}",
         )
 
-    ax.axvline(-effect_threshold, color="#555555", lw=0.9, ls="--")
-    ax.axvline(effect_threshold, color="#555555", lw=0.9, ls="--")
-    ax.axhline(-np.log10(alpha), color="#555555", lw=0.9, ls=":")
+    significance_cutoff = -np.log10(alpha)
+    ax.axhline(significance_cutoff, color="#555555", lw=0.9, ls="--")
+    ax.axhline(-significance_cutoff, color="#555555", lw=0.9, ls="--")
+    ax.axhline(0, color="#777777", lw=0.7)
     colored = positive | negative
-    label_df = display_df.loc[colored].sort_values(
-        [fdr_col, effect_col], ascending=[True, False]
-    ).head(int(label_top_n))
+    label_df = plot_df.loc[colored].sort_values(
+        [fdr_col, "minus_log10_fdr"], ascending=[True, False]
+    ).head(max(0, int(label_top_n)))
     for _, row in label_df.iterrows():
         ax.annotate(
             row[site_col],
-            (row[effect_col], row["minus_log10_fdr"]),
+            (row["significance_rank"], row["signed_significance"]),
             xytext=(4, 4),
             textcoords="offset points",
             fontsize=8,
         )
 
-    absolute_effect = display_df[effect_col].abs().to_numpy(float)
-    robust_limit = float(np.nanquantile(absolute_effect, 0.99))
-    robust_limit = min(float(max_abs_effect), robust_limit * 1.05)
-    robust_limit = max(float(effect_threshold) * 1.25, robust_limit)
-    ax.set_xlim(-robust_limit, robust_limit)
-
-    n_zero = int(zero_boundary.sum())
-    n_extreme_only = int((extreme_effect & ~zero_boundary).sum())
-    n_excluded = int(plot_df["volcano_excluded"].sum())
-    if n_excluded:
-        ax.text(
-            0.02,
-            0.98,
-            f"Excluded boundary estimates: {n_excluded}\n"
-            f"zero A/G: {n_zero}; other |log2OR|>{max_abs_effect:g}: {n_extreme_only}",
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8,
-            color="#555555",
-        )
-    ax.set_xlabel("WM effect (log2 odds ratio)")
-    ax.set_ylabel(f"-log10({fdr_col})")
+    ax.set_xlim(0.5, len(plot_df) + 0.5)
+    ax.set_xlabel("Sites ranked by signed significance")
+    ax.set_ylabel(
+        "signed -log10(FDR)\n(+ WM-high; - non-WM-high)"
+    )
     ax.set_title(title)
     ax.legend(frameon=False, fontsize=8, loc="best")
     fig.tight_layout()
@@ -2169,82 +2136,156 @@ def plot_recurrent_sv_wm_effect_heatmap(
     sites: Optional[Sequence[str]] = None,
     top_n: int = 30,
     alpha: float = 0.05,
+    direction: str = "both",
     title: str = "Recurrent SV-A-to-I WM effects across slices",
     figsize=None,
 ):
-    """Heatmap of slice-specific WM log2 odds ratios; stars mark within-slice FDR < alpha."""
+    """Plot direction-separated heatmaps of significant recurrent sites.
+
+    A cell is displayed solely when its within-slice FDR is below ``alpha``.
+    The sign of ``effect_col`` determines its direction: positive values are
+    WM-high and negative values are non-WM-high.  Effect-size magnitude is not
+    used as a threshold.  Cell colour represents ``-log10(FDR)`` rather than
+    the log2 odds ratio.
+
+    Parameters
+    ----------
+    direction
+        ``"both"`` (default) draws separate WM-high and non-WM-high panels.
+        ``"wm"`` or ``"nonwm"`` draws just the requested direction.
+
+    Returns
+    -------
+    fig, axes, effects, fdr
+        ``effects`` and ``fdr`` are the complete numeric matrices for the sites
+        shown in at least one panel.  For ``direction="both"``, ``axes`` is a
+        two-element NumPy array; otherwise it is a single Matplotlib axis.
+    """
     if per_slice_results is None or per_slice_results.empty:
         raise ValueError("per_slice_results is empty.")
     required = {site_col, sample_col, effect_col, fdr_col}
     missing = required.difference(per_slice_results.columns)
     if missing:
         raise ValueError(f"per_slice_results is missing required columns: {sorted(missing)}")
+    direction = str(direction).lower().replace("-", "")
+    direction_aliases = {
+        "both": "both", "wm": "wm", "wmhigh": "wm",
+        "nonwm": "nonwm", "nonwmhigh": "nonwm",
+    }
+    if direction not in direction_aliases:
+        raise ValueError("direction must be 'both', 'wm', or 'nonwm'.")
+    direction = direction_aliases[direction]
     samples = [str(sample) for sample in sample_order]
-
-    if sites is None:
-        if pooled_results is not None and not pooled_results.empty:
-            ranking = pooled_results.copy()
-            ranking[site_col] = ranking[site_col].astype(str)
-            ranking[pooled_fdr_col] = pd.to_numeric(
-                ranking[pooled_fdr_col], errors="coerce"
-            )
-            sites = ranking.sort_values(
-                pooled_fdr_col, na_position="last"
-            )[site_col].head(int(top_n)).tolist()
-        else:
-            sites = per_slice_results[site_col].astype(str).drop_duplicates().head(int(top_n)).tolist()
-    sites = [str(site) for site in sites]
-    if not sites:
-        raise ValueError("No recurrent site is available for the heatmap.")
 
     frame = per_slice_results.copy()
     frame[site_col] = frame[site_col].astype(str)
     frame[sample_col] = frame[sample_col].astype(str)
-    frame = frame.loc[frame[site_col].isin(sites)]
-    effects = frame.pivot_table(
-        index=site_col, columns=sample_col, values=effect_col, aggfunc="first"
-    ).reindex(index=sites, columns=samples)
-    fdr = frame.pivot_table(
-        index=site_col, columns=sample_col, values=fdr_col, aggfunc="first"
-    ).reindex(index=sites, columns=samples)
-    stars = fdr.applymap(lambda value: "*" if pd.notna(value) and value < alpha else "")
+    frame[effect_col] = pd.to_numeric(frame[effect_col], errors="coerce")
+    frame[fdr_col] = pd.to_numeric(frame[fdr_col], errors="coerce")
+    if sites is not None:
+        allowed_sites = [str(site) for site in sites]
+        frame = frame.loc[frame[site_col].isin(allowed_sites)].copy()
+    if frame.empty:
+        raise ValueError("No recurrent site is available for the heatmap.")
 
-    finite = np.abs(effects.to_numpy(dtype=float))
-    finite = finite[np.isfinite(finite)]
-    limit = float(np.quantile(finite, 0.95)) if finite.size else 1.0
-    limit = max(limit, 1.0)
+    all_effects = frame.pivot_table(
+        index=site_col, columns=sample_col, values=effect_col, aggfunc="first"
+    ).reindex(columns=samples)
+    all_fdr = frame.pivot_table(
+        index=site_col, columns=sample_col, values=fdr_col, aggfunc="first"
+    ).reindex(columns=samples)
+    all_effects, all_fdr = all_effects.align(all_fdr, join="outer", axis=0)
+
+    wm_mask = all_fdr.lt(alpha) & all_effects.gt(0)
+    nonwm_mask = all_fdr.lt(alpha) & all_effects.lt(0)
+
+    def _rank_sites(mask):
+        qualifying_fdr = all_fdr.where(mask)
+        ranking = pd.DataFrame({
+            "min_fdr": qualifying_fdr.min(axis=1, skipna=True),
+            "n_significant_slices": mask.sum(axis=1),
+        })
+        ranking = ranking.loc[ranking["n_significant_slices"].gt(0)]
+        ranking = ranking.sort_values(
+            ["n_significant_slices", "min_fdr"],
+            ascending=[False, True],
+        )
+        if top_n is not None:
+            ranking = ranking.head(max(0, int(top_n)))
+        return ranking.index.astype(str).tolist()
+
+    requested = ["wm", "nonwm"] if direction == "both" else [direction]
+    masks = {"wm": wm_mask, "nonwm": nonwm_mask}
+    direction_sites = {key: _rank_sites(masks[key]) for key in requested}
+    shown_sites = []
+    for key in requested:
+        shown_sites.extend(site for site in direction_sites[key] if site not in shown_sites)
+
+    effects = all_effects.reindex(index=shown_sites, columns=samples)
+    fdr = all_fdr.reindex(index=shown_sites, columns=samples)
+    significance = -np.log10(all_fdr.clip(lower=np.finfo(float).tiny))
+    finite_significance = significance.where(wm_mask | nonwm_mask).to_numpy(float)
+    finite_significance = finite_significance[np.isfinite(finite_significance)]
+    vmax = max(float(np.nanmax(finite_significance)), -np.log10(alpha)) \
+        if finite_significance.size else -np.log10(alpha)
+
+    n_panels = len(requested)
+    max_rows = max([len(direction_sites[key]) for key in requested] + [1])
     if figsize is None:
-        figsize = (5.8, max(4.2, 0.28 * len(sites) + 1.8))
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.set_facecolor("#eeeeee")
-    sns.heatmap(
-        effects,
-        mask=effects.isna(),
-        cmap="RdBu_r",
-        center=0,
-        vmin=-limit,
-        vmax=limit,
-        annot=stars,
-        fmt="",
-        linewidths=0.35,
-        linecolor="white",
-        cbar_kws={"label": "WM effect (log2 odds ratio)"},
-        ax=ax,
+        figsize = (
+            6.0 * n_panels,
+            max(4.2, 0.28 * max_rows + 2.0),
+        )
+    fig, axes_array = plt.subplots(
+        1, n_panels, figsize=figsize, squeeze=False,
+        constrained_layout=True,
+        gridspec_kw={"wspace": 0.42},
     )
-    ax.set_xlabel("Slice")
-    ax.set_ylabel("Recurrent SV-A-to-I site")
-    ax.set_title(title)
-    ax.text(
-        0,
-        -0.07,
-        f"* within-slice FDR < {alpha:g}; grey cells lack WM/non-WM support",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=8,
+    axes_flat = axes_array.ravel()
+
+    panel_settings = {
+        "wm": ("WM-high", "Oranges"),
+        "nonwm": ("non-WM-high", "Blues"),
+    }
+    for ax, key in zip(axes_flat, requested):
+        panel_title, cmap = panel_settings[key]
+        panel_sites = direction_sites[key]
+        ax.set_facecolor("#eeeeee")
+        if not panel_sites:
+            ax.text(
+                0.5, 0.5,
+                f"No {panel_title} site with FDR < {alpha:g}",
+                transform=ax.transAxes, ha="center", va="center",
+            )
+            ax.set_axis_off()
+            continue
+        panel = significance.reindex(index=panel_sites, columns=samples)
+        panel_mask = ~masks[key].reindex(index=panel_sites, columns=samples).fillna(False)
+        sns.heatmap(
+            panel,
+            mask=panel_mask,
+            cmap=cmap,
+            vmin=-np.log10(alpha),
+            vmax=vmax,
+            linewidths=0.35,
+            linecolor="white",
+            cbar_kws={"label": "-log10(within-slice FDR)"},
+            ax=ax,
+        )
+        ax.set_xlabel("Slice")
+        ax.set_ylabel("Recurrent SV-A-to-I site")
+        ax.set_title(f"{panel_title}: FDR < {alpha:g}")
+
+    if title:
+        fig.suptitle(title, y=1.01, fontsize=12)
+    fig.text(
+        0.01, 0.01,
+        "Grey cells are non-significant or have the opposite direction; "
+        "log2FC magnitude is not used for filtering.",
+        ha="left", va="bottom", fontsize=8,
     )
-    fig.tight_layout()
-    return fig, ax, effects, fdr
+    axes = axes_flat if direction == "both" else axes_flat[0]
+    return fig, axes, effects, fdr
 
 
 
