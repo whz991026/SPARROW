@@ -18,7 +18,7 @@ import statsmodels.api as sm
 from scipy import sparse
 from scipy.stats import spearmanr, pearsonr, mannwhitneyu, fisher_exact
 from statsmodels.stats.multitest import multipletests
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 from scipy.linalg import qr
 from scipy.optimize import minimize
 from scipy.special import expit, logit, gammaln, betaln
@@ -56,7 +56,9 @@ __all__ = [
     "plot_cross_sample_site_spatial_ratios",
     "plot_external_overlap_summary",
     "plot_global_atoi_two_r2_donuts",
+    "plot_recurrent_sv_wm_candidate_funnel",
     "plot_recurrent_sv_wm_effect_heatmap",
+    "plot_recurrent_sv_wm_forest",
     "plot_residual_progression",
     "plot_three_slice_sv_atoi_upset",
     "plot_top_sv_site_patterns",
@@ -1572,7 +1574,9 @@ def analyze_recurrent_sv_wm_binomial(
     Recurrent sites are those called as SV-A-to-I in every requested slice.
     Single-slice models use ``logit(p) = intercept + WM``. The pooled model
     uses ``logit(p) = slice + WM``; a nested slice-specific-WM model tests
-    heterogeneity. No x/y terms are included because this analysis targets the
+    heterogeneity. A slice enters the pooled model only when both WM and
+    non-WM meet ``min_spots_per_group``, and at least two eligible slices are
+    required. No x/y terms are included because this analysis targets the
     anatomical WM contrast itself. Ordinary and Pearson-dispersion-adjusted
     likelihood-ratio p values are both returned.
     """
@@ -1643,6 +1647,8 @@ def analyze_recurrent_sv_wm_binomial(
                 "nonwm_A": nonwm_a, "nonwm_G": nonwm_g,
                 "support_ok": sufficient, "fit_status": "insufficient_support",
                 "wm_log_odds": np.nan, "wm_log2fc": np.nan,
+                "wm_log2fc_se": np.nan, "wm_log2fc_ci_low": np.nan,
+                "wm_log2fc_ci_high": np.nan,
                 "wm_odds_ratio": np.nan, "binomial_lrt": np.nan,
                 "binomial_p": np.nan, "pearson_dispersion": np.nan,
                 "dispersion_adjusted_p": np.nan,
@@ -1657,9 +1663,14 @@ def analyze_recurrent_sv_wm_binomial(
                     )
                     lrt = max(0.0, 2.0 * (float(fit1.llf) - float(fit0.llf)))
                     beta = float(fit1.params[-1])
+                    beta_se = float(fit1.bse[-1])
+                    log2_se = beta_se / np.log(2.0)
                     row.update({
                         "fit_status": "ok", "wm_log_odds": beta,
                         "wm_log2fc": beta / np.log(2.0),
+                        "wm_log2fc_se": log2_se,
+                        "wm_log2fc_ci_low": (beta - 1.96 * beta_se) / np.log(2.0),
+                        "wm_log2fc_ci_high": (beta + 1.96 * beta_se) / np.log(2.0),
                         "wm_odds_ratio": float(np.exp(np.clip(beta, -30, 30))),
                         "binomial_lrt": lrt,
                         "binomial_p": float(chi2.sf(lrt, 1)),
@@ -1696,42 +1707,72 @@ def analyze_recurrent_sv_wm_binomial(
         pieces = frames_by_site.get(site, [])
         if not pieces:
             continue
-        frame = pd.concat(pieces, ignore_index=True)
-        sample_cat = pd.Categorical(frame["sample_id"], categories=samples, ordered=True)
-        dummies = pd.get_dummies(sample_cat, prefix="slice", drop_first=True, dtype=float)
-        base = np.column_stack([np.ones(len(frame)), dummies.to_numpy(float)])
-        base_names = ["const"] + dummies.columns.tolist()
-        wm = frame["is_wm"].to_numpy(float)
-        support_samples = []
+        full_frame = pd.concat(pieces, ignore_index=True)
+        eligible_samples = []
         directions = []
         for sample in samples:
-            sub = frame.loc[frame["sample_id"].eq(sample)]
-            has_both = sub["is_wm"].any() and (~sub["is_wm"]).any()
-            if has_both:
-                support_samples.append(sample)
+            sub = full_frame.loc[full_frame["sample_id"].eq(sample)]
+            n_wm = int(sub["is_wm"].sum())
+            n_nonwm = int((~sub["is_wm"]).sum())
+            eligible = (
+                n_wm >= int(min_spots_per_group)
+                and n_nonwm >= int(min_spots_per_group)
+            )
+            if eligible:
+                eligible_samples.append(sample)
                 wm_g = float(sub.loc[sub["is_wm"], "G"].sum())
                 wm_a = float(sub.loc[sub["is_wm"], "A"].sum())
                 nw_g = float(sub.loc[~sub["is_wm"], "G"].sum())
                 nw_a = float(sub.loc[~sub["is_wm"], "A"].sum())
                 odds = ((wm_g + 0.5) / (wm_a + 0.5)) / ((nw_g + 0.5) / (nw_a + 0.5))
                 directions.append(odds > 1.0)
+
+        frame = full_frame.loc[
+            full_frame["sample_id"].isin(eligible_samples)
+        ].copy()
+        wm_bool = frame["is_wm"].to_numpy(bool) if not frame.empty else np.array([], dtype=bool)
         row = {
             "site": site,
             "n_spots": int(len(frame)),
-            "n_wm_spots": int(frame["is_wm"].sum()),
-            "n_nonwm_spots": int((~frame["is_wm"]).sum()),
-            "n_slices_with_both_regions": len(support_samples),
+            "n_spots_all_slices": int(len(full_frame)),
+            "n_wm_spots": int(wm_bool.sum()),
+            "n_nonwm_spots": int((~wm_bool).sum()) if len(wm_bool) else 0,
+            "wm_A": float(frame.loc[wm_bool, "A"].sum()) if len(frame) else 0.0,
+            "wm_G": float(frame.loc[wm_bool, "G"].sum()) if len(frame) else 0.0,
+            "nonwm_A": float(frame.loc[~wm_bool, "A"].sum()) if len(frame) else 0.0,
+            "nonwm_G": float(frame.loc[~wm_bool, "G"].sum()) if len(frame) else 0.0,
+            "n_eligible_slices": len(eligible_samples),
+            # Retained as a compatibility alias; it now means slices meeting
+            # min_spots_per_group in both WM and non-WM.
+            "n_slices_with_both_regions": len(eligible_samples),
+            "eligible_slices": ",".join(eligible_samples),
             "all_supported_slices_positive": bool(directions) and all(directions),
             "fit_status": "insufficient_support",
             "wm_log_odds": np.nan, "wm_log2fc": np.nan,
+            "wm_log2fc_se": np.nan, "wm_log2fc_ci_low": np.nan,
+            "wm_log2fc_ci_high": np.nan,
             "wm_odds_ratio": np.nan, "pooled_binomial_lrt": np.nan,
             "pooled_binomial_p": np.nan, "pearson_dispersion": np.nan,
             "pooled_dispersion_adjusted_p": np.nan,
             "heterogeneity_lrt": np.nan, "heterogeneity_df": np.nan,
             "heterogeneity_p": np.nan,
         }
-        if len(support_samples) >= 1:
+        # A pooled cross-slice effect requires at least two independently
+        # eligible slices. Unsupported slices are excluded from the fit rather
+        # than merely omitted from the support count.
+        if len(eligible_samples) >= 2:
             try:
+                sample_cat = pd.Categorical(
+                    frame["sample_id"], categories=eligible_samples, ordered=True
+                )
+                dummies = pd.get_dummies(
+                    sample_cat, prefix="slice", drop_first=True, dtype=float
+                )
+                base = np.column_stack([
+                    np.ones(len(frame)), dummies.to_numpy(float)
+                ])
+                base_names = ["const"] + dummies.columns.tolist()
+                wm = frame["is_wm"].to_numpy(float)
                 fit0, _ = _fit_grouped_binomial_glm(
                     frame["G"], frame["A"], base, base_names
                 )
@@ -1741,32 +1782,36 @@ def analyze_recurrent_sv_wm_binomial(
                 )
                 lrt = max(0.0, 2.0 * (float(fit1.llf) - float(fit0.llf)))
                 beta = float(fit1.params[-1])
+                beta_se = float(fit1.bse[-1])
+                log2_se = beta_se / np.log(2.0)
                 row.update({
                     "fit_status": "ok", "wm_log_odds": beta,
                     "wm_log2fc": beta / np.log(2.0),
+                    "wm_log2fc_se": log2_se,
+                    "wm_log2fc_ci_low": (beta - 1.96 * beta_se) / np.log(2.0),
+                    "wm_log2fc_ci_high": (beta + 1.96 * beta_se) / np.log(2.0),
                     "wm_odds_ratio": float(np.exp(np.clip(beta, -30, 30))),
                     "pooled_binomial_lrt": lrt,
                     "pooled_binomial_p": float(chi2.sf(lrt, 1)),
                     "pearson_dispersion": dispersion,
                     "pooled_dispersion_adjusted_p": float(chi2.sf(lrt / dispersion, 1)),
                 })
-                if len(support_samples) >= 2:
-                    wm_by_slice = np.column_stack([
-                        wm * frame["sample_id"].eq(sample).to_numpy(float)
-                        for sample in support_samples
-                    ])
-                    heter_x = np.column_stack([base, wm_by_slice])
-                    heter_names = base_names + [f"WM:{s}" for s in support_samples]
-                    fit2, _ = _fit_grouped_binomial_glm(
-                        frame["G"], frame["A"], heter_x, heter_names
-                    )
-                    heter_lrt = max(0.0, 2.0 * (float(fit2.llf) - float(fit1.llf)))
-                    heter_df = len(support_samples) - 1
-                    row.update({
-                        "heterogeneity_lrt": heter_lrt,
-                        "heterogeneity_df": heter_df,
-                        "heterogeneity_p": float(chi2.sf(heter_lrt, heter_df)),
-                    })
+                wm_by_slice = np.column_stack([
+                    wm * frame["sample_id"].eq(sample).to_numpy(float)
+                    for sample in eligible_samples
+                ])
+                heter_x = np.column_stack([base, wm_by_slice])
+                heter_names = base_names + [f"WM:{s}" for s in eligible_samples]
+                fit2, _ = _fit_grouped_binomial_glm(
+                    frame["G"], frame["A"], heter_x, heter_names
+                )
+                heter_lrt = max(0.0, 2.0 * (float(fit2.llf) - float(fit1.llf)))
+                heter_df = len(eligible_samples) - 1
+                row.update({
+                    "heterogeneity_lrt": heter_lrt,
+                    "heterogeneity_df": heter_df,
+                    "heterogeneity_p": float(chi2.sf(heter_lrt, heter_df)),
+                })
             except Exception:
                 row["fit_status"] = "fit_failed"
         pooled_rows.append(row)
@@ -1809,6 +1854,7 @@ def plot_wm_aware_sv_signed_significance(
     max_abs_effect: float = 6.0,
     exclude_zero_count_boundaries: bool = True,
     label_top_n: int = 8,
+    highlight_sites: Optional[Sequence[str]] = None,
     title: str = "WM-aware SV-A-to-I sites",
     figsize=(6.8, 5.2),
 ):
@@ -1899,7 +1945,8 @@ def plot_wm_aware_sv_signed_significance(
     ax.axhline(-significance_cutoff, color="#555555", lw=0.9, ls="--")
     ax.axhline(0, color="#777777", lw=0.7)
     colored = positive | negative
-    label_df = plot_df.loc[colored].sort_values(
+    highlighted = set(str(site) for site in (highlight_sites or []))
+    label_df = plot_df.loc[colored & ~plot_df[site_col].isin(highlighted)].sort_values(
         [fdr_col, "minus_log10_fdr"], ascending=[True, False]
     ).head(max(0, int(label_top_n)))
     for _, row in label_df.iterrows():
@@ -1910,6 +1957,23 @@ def plot_wm_aware_sv_signed_significance(
             textcoords="offset points",
             fontsize=8,
         )
+
+    highlight_df = plot_df.loc[plot_df[site_col].isin(highlighted)]
+    if not highlight_df.empty:
+        ax.scatter(
+            highlight_df["significance_rank"],
+            highlight_df["signed_significance"],
+            marker="*", s=190, facecolor="#ffd92f", edgecolor="black",
+            linewidth=1.2, zorder=6, label="Joint recurrent candidate",
+        )
+        for _, row in highlight_df.iterrows():
+            ax.annotate(
+                row[site_col],
+                (row["significance_rank"], row["signed_significance"]),
+                xytext=(7, 7), textcoords="offset points",
+                fontsize=9, fontweight="bold",
+                arrowprops={"arrowstyle": "-", "lw": 0.7, "color": "black"},
+            )
 
     ax.set_xlim(0.5, len(plot_df) + 0.5)
     ax.set_xlabel("Sites ranked by signed significance")
@@ -2123,6 +2187,198 @@ def plot_cross_sample_site_spatial_ratios(
     return fig, axes, pd.DataFrame(summary_rows)
 
 
+def plot_recurrent_sv_wm_candidate_funnel(
+    pooled_results: pd.DataFrame,
+    required_slices: int = 3,
+    min_spots_per_group: int = 5,
+    alpha: float = 0.05,
+    site_col: str = "site",
+    effect_col: str = "wm_log2fc",
+    fdr_col: str = "pooled_binomial_fdr",
+    support_col: str = "n_eligible_slices",
+    consistent_col: str = "all_supported_slices_positive",
+    heterogeneity_col: str = "heterogeneity_p",
+    title: str = "Recurrent SV-A-to-I joint-candidate filtering",
+    figsize=(7.2, 4.4),
+):
+    """Visualize the sequential, pre-specified joint-candidate criteria."""
+    if pooled_results is None or pooled_results.empty:
+        raise ValueError("pooled_results is empty.")
+    if support_col not in pooled_results.columns:
+        support_col = "n_slices_with_both_regions"
+    required = {
+        site_col, effect_col, fdr_col, support_col,
+        consistent_col, heterogeneity_col,
+    }
+    missing = required.difference(pooled_results.columns)
+    if missing:
+        raise ValueError(
+            f"pooled_results is missing required columns: {sorted(missing)}"
+        )
+
+    frame = pooled_results.copy()
+    frame[effect_col] = pd.to_numeric(frame[effect_col], errors="coerce")
+    frame[fdr_col] = pd.to_numeric(frame[fdr_col], errors="coerce")
+    frame[support_col] = pd.to_numeric(frame[support_col], errors="coerce")
+    frame[heterogeneity_col] = pd.to_numeric(
+        frame[heterogeneity_col], errors="coerce"
+    )
+    keep_support = frame[support_col].ge(int(required_slices))
+    keep_pooled = (
+        keep_support & frame[fdr_col].lt(alpha) & frame[effect_col].gt(0)
+    )
+    keep_direction = keep_pooled & frame[consistent_col].fillna(False).astype(bool)
+    keep_heterogeneity = (
+        keep_direction
+        & frame[heterogeneity_col].notna()
+        & frame[heterogeneity_col].ge(alpha)
+    )
+    masks = [
+        pd.Series(True, index=frame.index),
+        keep_support,
+        keep_pooled,
+        keep_direction,
+        keep_heterogeneity,
+    ]
+    labels = [
+        "Recurrent SV-A-to-I sites",
+        f"All {required_slices} slices eligible\n"
+        f"(each group >= {int(min_spots_per_group)} spots)",
+        f"Pooled FDR < {alpha:g}\nand WM effect > 0",
+        "Positive direction\nin every eligible slice",
+        f"No detected heterogeneity\n(p >= {alpha:g})",
+    ]
+    funnel_df = pd.DataFrame({
+        "stage": labels,
+        "n_sites": [int(mask.sum()) for mask in masks],
+    })
+    final_sites = frame.loc[keep_heterogeneity, site_col].astype(str).tolist()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    y = np.arange(len(funnel_df))
+    colors = ["#bdbdbd", "#9ecae1", "#6baed6", "#fd8d3c", "#d95f02"]
+    ax.barh(y, funnel_df["n_sites"], color=colors, height=0.68)
+    ax.set_yticks(y)
+    ax.set_yticklabels(funnel_df["stage"])
+    ax.invert_yaxis()
+    ax.set_xlabel("Number of sites retained")
+    ax.set_title(title)
+    for yi, value in zip(y, funnel_df["n_sites"]):
+        ax.text(value, yi, f"  {int(value)}", va="center", fontweight="bold")
+    if final_sites:
+        ax.text(
+            0.99, 0.04, "Final: " + ", ".join(final_sites),
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=9, fontweight="bold",
+        )
+    sns.despine(ax=ax)
+    fig.tight_layout()
+    return fig, ax, funnel_df
+
+
+def plot_recurrent_sv_wm_forest(
+    per_slice_results: pd.DataFrame,
+    pooled_results: pd.DataFrame,
+    site: str = "1_634012",
+    sample_order=("151673", "151671", "151507"),
+    site_col: str = "site",
+    sample_col: str = "sample_id",
+    effect_col: str = "wm_log2fc",
+    ci_low_col: str = "wm_log2fc_ci_low",
+    ci_high_col: str = "wm_log2fc_ci_high",
+    slice_fdr_col: str = "binomial_fdr_within_slice",
+    pooled_fdr_col: str = "pooled_binomial_fdr",
+    alpha: float = 0.05,
+    title: Optional[str] = None,
+    figsize=(8.0, 4.5),
+):
+    """Forest plot of slice-specific and pooled WM effects for one site."""
+    if per_slice_results is None or per_slice_results.empty:
+        raise ValueError("per_slice_results is empty.")
+    if pooled_results is None or pooled_results.empty:
+        raise ValueError("pooled_results is empty.")
+    site = str(site)
+    slices = per_slice_results.copy()
+    slices[site_col] = slices[site_col].astype(str)
+    slices[sample_col] = slices[sample_col].astype(str)
+    slices = slices.loc[slices[site_col].eq(site)].copy()
+    pooled = pooled_results.copy()
+    pooled[site_col] = pooled[site_col].astype(str)
+    pooled = pooled.loc[pooled[site_col].eq(site)].copy()
+    if slices.empty or pooled.empty:
+        raise ValueError(f"Site {site!r} is missing from per-slice or pooled results.")
+
+    slices = slices.set_index(sample_col).reindex([str(x) for x in sample_order])
+    rows = []
+    for sample, row in slices.iterrows():
+        rows.append({
+            "label": str(sample), "kind": "slice",
+            "effect": pd.to_numeric(row.get(effect_col), errors="coerce"),
+            "ci_low": pd.to_numeric(row.get(ci_low_col), errors="coerce"),
+            "ci_high": pd.to_numeric(row.get(ci_high_col), errors="coerce"),
+            "fdr": pd.to_numeric(row.get(slice_fdr_col), errors="coerce"),
+            "n_wm": pd.to_numeric(row.get("n_wm_spots"), errors="coerce"),
+            "n_nonwm": pd.to_numeric(row.get("n_nonwm_spots"), errors="coerce"),
+        })
+    pooled_row = pooled.iloc[0]
+    rows.append({
+        "label": "Pooled", "kind": "pooled",
+        "effect": pd.to_numeric(pooled_row.get(effect_col), errors="coerce"),
+        "ci_low": pd.to_numeric(pooled_row.get(ci_low_col), errors="coerce"),
+        "ci_high": pd.to_numeric(pooled_row.get(ci_high_col), errors="coerce"),
+        "fdr": pd.to_numeric(pooled_row.get(pooled_fdr_col), errors="coerce"),
+        "n_wm": pd.to_numeric(pooled_row.get("n_wm_spots"), errors="coerce"),
+        "n_nonwm": pd.to_numeric(pooled_row.get("n_nonwm_spots"), errors="coerce"),
+    })
+    plot_df = pd.DataFrame(rows)
+    y = np.arange(len(plot_df))[::-1]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.axvline(0, color="#666666", lw=0.9, ls="--")
+    for yi, (_, row) in zip(y, plot_df.iterrows()):
+        effect = row["effect"]
+        if not np.isfinite(effect):
+            continue
+        color = "#d95f02" if effect > 0 else "#4e79a7"
+        marker = "D" if row["kind"] == "pooled" else "o"
+        size = 8 if row["kind"] == "pooled" else 6
+        if np.isfinite(row["ci_low"]) and np.isfinite(row["ci_high"]):
+            ax.errorbar(
+                effect, yi,
+                xerr=[[effect - row["ci_low"]], [row["ci_high"] - effect]],
+                fmt=marker, ms=size, color=color, ecolor=color,
+                elinewidth=1.3, capsize=3, zorder=3,
+            )
+        else:
+            ax.plot(effect, yi, marker=marker, ms=size, color=color, zorder=3)
+        q_text = "NA" if not np.isfinite(row["fdr"]) else f"{row['fdr']:.3g}"
+        star = " *" if np.isfinite(row["fdr"]) and row["fdr"] < alpha else ""
+        ax.annotate(
+            f"FDR={q_text}{star}", (effect, yi),
+            xytext=(7, 7), textcoords="offset points", fontsize=8,
+        )
+
+    ylabels = []
+    for _, row in plot_df.iterrows():
+        if np.isfinite(row["n_wm"]) and np.isfinite(row["n_nonwm"]):
+            ylabels.append(
+                f"{row['label']}  (WM={int(row['n_wm'])}, non-WM={int(row['n_nonwm'])})"
+            )
+        else:
+            ylabels.append(str(row["label"]))
+    ax.set_yticks(y)
+    ax.set_yticklabels(ylabels)
+    ax.set_xlabel("WM effect (log2 odds ratio) with 95% CI")
+    ax.set_title(title or f"{site}: recurrent WM-effect evidence across slices")
+    ax.text(
+        0.01, 0.02, f"* FDR < {alpha:g}; positive values indicate WM-high editing",
+        transform=ax.transAxes, ha="left", va="bottom", fontsize=8,
+    )
+    sns.despine(ax=ax)
+    fig.tight_layout()
+    return fig, ax, plot_df
+
+
 def plot_recurrent_sv_wm_effect_heatmap(
     per_slice_results: pd.DataFrame,
     pooled_results: Optional[pd.DataFrame] = None,
@@ -2139,13 +2395,12 @@ def plot_recurrent_sv_wm_effect_heatmap(
     title: str = "Recurrent SV-A-to-I WM effects across slices",
     figsize=None,
 ):
-    """Plot direction-separated heatmaps of significant recurrent sites.
+    """Plot direction-separated reproducibility heatmaps for recurrent sites.
 
-    A cell is displayed solely when its within-slice FDR is below ``alpha``.
-    The sign of ``effect_col`` determines its direction: positive values are
-    WM-high and negative values are non-WM-high.  Effect-size magnitude is not
-    used as a threshold.  Cell colour represents ``-log10(FDR)`` rather than
-    the log2 odds ratio.
+    Rows are selected by pooled FDR and pooled direction, without an absolute
+    log2FC threshold. Every eligible slice-specific effect remains visible so
+    concordant but individually underpowered slices are not hidden. Stars mark
+    within-slice FDR < ``alpha``; a black outline marks final joint candidates.
 
     Parameters
     ----------
@@ -2162,6 +2417,8 @@ def plot_recurrent_sv_wm_effect_heatmap(
     """
     if per_slice_results is None or per_slice_results.empty:
         raise ValueError("per_slice_results is empty.")
+    if pooled_results is None or pooled_results.empty:
+        raise ValueError("pooled_results is required for reproducibility heatmaps.")
     required = {site_col, sample_col, effect_col, fdr_col}
     missing = required.difference(per_slice_results.columns)
     if missing:
@@ -2195,39 +2452,41 @@ def plot_recurrent_sv_wm_effect_heatmap(
     ).reindex(columns=samples)
     all_effects, all_fdr = all_effects.align(all_fdr, join="outer", axis=0)
 
-    wm_mask = all_fdr.lt(alpha) & all_effects.gt(0)
-    nonwm_mask = all_fdr.lt(alpha) & all_effects.lt(0)
+    pooled = pooled_results.copy()
+    pooled[site_col] = pooled[site_col].astype(str)
+    pooled[effect_col] = pd.to_numeric(pooled[effect_col], errors="coerce")
+    pooled[pooled_fdr_col] = pd.to_numeric(
+        pooled[pooled_fdr_col], errors="coerce"
+    )
+    pooled = pooled.drop_duplicates(site_col).set_index(site_col)
+    pooled_effect = pooled[effect_col].reindex(all_effects.index)
+    pooled_fdr = pooled[pooled_fdr_col].reindex(all_effects.index)
+    joint = (
+        pooled.get("joint_candidate", pd.Series(False, index=pooled.index))
+        .reindex(all_effects.index).fillna(False).astype(bool)
+    )
 
-    def _rank_sites(mask):
-        qualifying_fdr = all_fdr.where(mask)
-        ranking = pd.DataFrame({
-            "min_fdr": qualifying_fdr.min(axis=1, skipna=True),
-            "n_significant_slices": mask.sum(axis=1),
-        })
-        ranking = ranking.loc[ranking["n_significant_slices"].gt(0)]
+    def _rank_sites(key):
+        sign_ok = pooled_effect.gt(0) if key == "wm" else pooled_effect.lt(0)
+        ranking = pd.DataFrame({"pooled_fdr": pooled_fdr, "joint": joint})
+        ranking = ranking.loc[pooled_fdr.lt(alpha) & sign_ok]
         ranking = ranking.sort_values(
-            ["n_significant_slices", "min_fdr"],
-            ascending=[False, True],
+            ["joint", "pooled_fdr"], ascending=[False, True]
         )
         if top_n is not None:
             ranking = ranking.head(max(0, int(top_n)))
         return ranking.index.astype(str).tolist()
 
     requested = ["wm", "nonwm"] if direction == "both" else [direction]
-    masks = {"wm": wm_mask, "nonwm": nonwm_mask}
-    direction_sites = {key: _rank_sites(masks[key]) for key in requested}
+    direction_sites = {key: _rank_sites(key) for key in requested}
     shown_sites = []
     for key in requested:
         shown_sites.extend(site for site in direction_sites[key] if site not in shown_sites)
 
     effects = all_effects.reindex(index=shown_sites, columns=samples)
+    effects["Pooled"] = pooled_effect.reindex(shown_sites)
     fdr = all_fdr.reindex(index=shown_sites, columns=samples)
-    significance = -np.log10(all_fdr.clip(lower=np.finfo(float).tiny))
-    finite_significance = significance.where(wm_mask | nonwm_mask).to_numpy(float)
-    finite_significance = finite_significance[np.isfinite(finite_significance)]
-    vmax = max(float(np.nanmax(finite_significance)), -np.log10(alpha)) \
-        if finite_significance.size else -np.log10(alpha)
-
+    fdr["Pooled"] = pooled_fdr.reindex(shown_sites)
     n_panels = len(requested)
     max_rows = max([len(direction_sites[key]) for key in requested] + [1])
     if figsize is None:
@@ -2258,29 +2517,58 @@ def plot_recurrent_sv_wm_effect_heatmap(
             )
             ax.set_axis_off()
             continue
-        panel = significance.reindex(index=panel_sites, columns=samples)
-        panel_mask = ~masks[key].reindex(index=panel_sites, columns=samples).fillna(False)
+        panel_effects = effects.reindex(index=panel_sites)
+        panel_fdr = fdr.reindex(index=panel_sites)
+        if key == "wm":
+            panel = panel_effects.where(panel_effects.gt(0))
+        else:
+            panel = (-panel_effects).where(panel_effects.lt(0))
+        panel_mask = panel.isna()
+        panel_values = panel.to_numpy(float)
+        panel_values = panel_values[np.isfinite(panel_values)]
+        panel_vmax = (
+            float(np.nanquantile(panel_values, 0.95))
+            if panel_values.size else 1.0
+        )
+        panel_vmax = max(panel_vmax, 0.25)
+        annotations = pd.DataFrame("", index=panel.index, columns=panel.columns)
+        for column in samples:
+            significant = panel_fdr[column].lt(alpha) & ~panel_mask[column]
+            annotations.loc[significant, column] = "*"
+        for row_site in panel.index:
+            q = panel_fdr.loc[row_site, "Pooled"]
+            if pd.notna(q):
+                annotations.loc[row_site, "Pooled"] = f"q={q:.2g}"
         sns.heatmap(
             panel,
             mask=panel_mask,
             cmap=cmap,
-            vmin=-np.log10(alpha),
-            vmax=vmax,
+            vmin=0,
+            vmax=panel_vmax,
+            annot=annotations,
+            fmt="",
             linewidths=0.35,
             linecolor="white",
-            cbar_kws={"label": "-log10(within-slice FDR)"},
+            cbar_kws={"label": "|WM effect| (log2 odds ratio)"},
             ax=ax,
         )
-        ax.set_xlabel("Slice")
+        for row_index, row_site in enumerate(panel.index):
+            if bool(joint.get(row_site, False)):
+                ax.add_patch(Rectangle(
+                    (0, row_index), panel.shape[1], 1,
+                    fill=False, edgecolor="black", linewidth=2.0,
+                    clip_on=False,
+                ))
+        ax.set_xlabel("Slice / pooled model")
         ax.set_ylabel("Recurrent SV-A-to-I site")
-        ax.set_title(f"{panel_title}: FDR < {alpha:g}")
+        ax.set_title(f"{panel_title}: pooled FDR < {alpha:g}")
 
     if title:
         fig.suptitle(title, y=1.01, fontsize=12)
     fig.text(
         0.01, 0.01,
-        "Grey cells are non-significant or have the opposite direction; "
-        "log2FC magnitude is not used for filtering.",
+        "Rows: pooled FDR < alpha (no |log2FC| cutoff). Stars: within-slice "
+        "FDR < alpha. Grey: unavailable/opposite direction. Black outline: joint candidate.",
         ha="left", va="bottom", fontsize=8,
     )
     axes = axes_flat if direction == "both" else axes_flat[0]
