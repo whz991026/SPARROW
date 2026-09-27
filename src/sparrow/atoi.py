@@ -1527,7 +1527,7 @@ def summarize_top_sv_atoi_sites(
 
 
 def _fit_grouped_binomial_glm(g, a, design, term_names):
-    """Fit grouped A/G binomial counts and return fit plus spot-level dispersion."""
+    """Fit grouped A/G binomial counts."""
     g = np.asarray(g, dtype=float)
     a = np.asarray(a, dtype=float)
     design = np.asarray(design, dtype=float)
@@ -1544,9 +1544,7 @@ def _fit_grouped_binomial_glm(g, a, design, term_names):
     ).fit(maxiter=200, disp=0)
     if not getattr(fit, "converged", True):
         raise RuntimeError("Grouped-binomial GLM did not converge.")
-    pearson = float(np.sum(np.asarray(fit.resid_pearson, dtype=float) ** 2))
-    dispersion = max(1.0, pearson / max(int(fit.df_resid), 1))
-    return fit, dispersion
+    return fit
 
 
 
@@ -1577,8 +1575,8 @@ def analyze_recurrent_sv_wm_binomial(
     heterogeneity. A slice enters the pooled model only when both WM and
     non-WM meet ``min_spots_per_group``, and at least two eligible slices are
     required. No x/y terms are included because this analysis targets the
-    anatomical WM contrast itself. Ordinary and Pearson-dispersion-adjusted
-    likelihood-ratio p values are both returned.
+    anatomical WM contrast itself. Likelihood-ratio p values and BH-FDR are
+    returned without a separate Pearson-dispersion adjustment branch.
     """
     samples = [str(x) for x in sample_ids]
     required = {sample_col, site_col, call_col}
@@ -1650,15 +1648,14 @@ def analyze_recurrent_sv_wm_binomial(
                 "wm_log2fc_se": np.nan, "wm_log2fc_ci_low": np.nan,
                 "wm_log2fc_ci_high": np.nan,
                 "wm_odds_ratio": np.nan, "binomial_lrt": np.nan,
-                "binomial_p": np.nan, "pearson_dispersion": np.nan,
-                "dispersion_adjusted_p": np.nan,
+                "binomial_p": np.nan,
             }
             if sufficient:
                 try:
                     x0 = np.ones((len(frame), 1), dtype=float)
                     x1 = np.column_stack([x0, frame["is_wm"].to_numpy(float)])
-                    fit0, _ = _fit_grouped_binomial_glm(frame["G"], frame["A"], x0, ["const"])
-                    fit1, dispersion = _fit_grouped_binomial_glm(
+                    fit0 = _fit_grouped_binomial_glm(frame["G"], frame["A"], x0, ["const"])
+                    fit1 = _fit_grouped_binomial_glm(
                         frame["G"], frame["A"], x1, ["const", "WM"]
                     )
                     lrt = max(0.0, 2.0 * (float(fit1.llf) - float(fit0.llf)))
@@ -1674,34 +1671,26 @@ def analyze_recurrent_sv_wm_binomial(
                         "wm_odds_ratio": float(np.exp(np.clip(beta, -30, 30))),
                         "binomial_lrt": lrt,
                         "binomial_p": float(chi2.sf(lrt, 1)),
-                        "pearson_dispersion": dispersion,
-                        "dispersion_adjusted_p": float(chi2.sf(lrt / dispersion, 1)),
                     })
                 except Exception:
                     row["fit_status"] = "fit_failed"
             per_rows.append(row)
 
     per_slice = pd.DataFrame(per_rows)
-    for pcol, fdr_col in [
-        ("binomial_p", "binomial_fdr_within_slice"),
-        ("dispersion_adjusted_p", "dispersion_adjusted_fdr_within_slice"),
-    ]:
-        per_slice[fdr_col] = np.nan
-        for _, index in per_slice.groupby("sample_id").groups.items():
-            valid_index = per_slice.loc[index].index[per_slice.loc[index, pcol].notna()]
-            if len(valid_index):
-                per_slice.loc[valid_index, fdr_col] = multipletests(
-                    per_slice.loc[valid_index, pcol].to_numpy(float), method="fdr_bh"
-                )[1]
+    per_slice["binomial_fdr_within_slice"] = np.nan
+    for _, index in per_slice.groupby("sample_id").groups.items():
+        valid_index = per_slice.loc[index].index[
+            per_slice.loc[index, "binomial_p"].notna()
+        ]
+        if len(valid_index):
+            per_slice.loc[valid_index, "binomial_fdr_within_slice"] = multipletests(
+                per_slice.loc[valid_index, "binomial_p"].to_numpy(float),
+                method="fdr_bh",
+            )[1]
     per_slice["binomial_candidate"] = (
         per_slice["binomial_fdr_within_slice"].lt(alpha)
         & per_slice["wm_log_odds"].gt(0)
     )
-    per_slice["dispersion_adjusted_candidate"] = (
-        per_slice["dispersion_adjusted_fdr_within_slice"].lt(alpha)
-        & per_slice["wm_log_odds"].gt(0)
-    )
-
     pooled_rows = []
     for site in recurrent_sites:
         pieces = frames_by_site.get(site, [])
@@ -1752,8 +1741,7 @@ def analyze_recurrent_sv_wm_binomial(
             "wm_log2fc_se": np.nan, "wm_log2fc_ci_low": np.nan,
             "wm_log2fc_ci_high": np.nan,
             "wm_odds_ratio": np.nan, "pooled_binomial_lrt": np.nan,
-            "pooled_binomial_p": np.nan, "pearson_dispersion": np.nan,
-            "pooled_dispersion_adjusted_p": np.nan,
+            "pooled_binomial_p": np.nan,
             "heterogeneity_lrt": np.nan, "heterogeneity_df": np.nan,
             "heterogeneity_p": np.nan,
         }
@@ -1773,11 +1761,11 @@ def analyze_recurrent_sv_wm_binomial(
                 ])
                 base_names = ["const"] + dummies.columns.tolist()
                 wm = frame["is_wm"].to_numpy(float)
-                fit0, _ = _fit_grouped_binomial_glm(
+                fit0 = _fit_grouped_binomial_glm(
                     frame["G"], frame["A"], base, base_names
                 )
                 common_x = np.column_stack([base, wm])
-                fit1, dispersion = _fit_grouped_binomial_glm(
+                fit1 = _fit_grouped_binomial_glm(
                     frame["G"], frame["A"], common_x, base_names + ["WM"]
                 )
                 lrt = max(0.0, 2.0 * (float(fit1.llf) - float(fit0.llf)))
@@ -1793,8 +1781,6 @@ def analyze_recurrent_sv_wm_binomial(
                     "wm_odds_ratio": float(np.exp(np.clip(beta, -30, 30))),
                     "pooled_binomial_lrt": lrt,
                     "pooled_binomial_p": float(chi2.sf(lrt, 1)),
-                    "pearson_dispersion": dispersion,
-                    "pooled_dispersion_adjusted_p": float(chi2.sf(lrt / dispersion, 1)),
                 })
                 wm_by_slice = np.column_stack([
                     wm * frame["sample_id"].eq(sample).to_numpy(float)
@@ -1802,7 +1788,7 @@ def analyze_recurrent_sv_wm_binomial(
                 ])
                 heter_x = np.column_stack([base, wm_by_slice])
                 heter_names = base_names + [f"WM:{s}" for s in eligible_samples]
-                fit2, _ = _fit_grouped_binomial_glm(
+                fit2 = _fit_grouped_binomial_glm(
                     frame["G"], frame["A"], heter_x, heter_names
                 )
                 heter_lrt = max(0.0, 2.0 * (float(fit2.llf) - float(fit1.llf)))
@@ -1819,7 +1805,6 @@ def analyze_recurrent_sv_wm_binomial(
     pooled = pd.DataFrame(pooled_rows)
     for pcol, fdr_col in [
         ("pooled_binomial_p", "pooled_binomial_fdr"),
-        ("pooled_dispersion_adjusted_p", "pooled_dispersion_adjusted_fdr"),
         ("heterogeneity_p", "heterogeneity_fdr"),
     ]:
         pooled[fdr_col] = np.nan
@@ -1831,14 +1816,9 @@ def analyze_recurrent_sv_wm_binomial(
     pooled["pooled_binomial_candidate"] = (
         pooled["pooled_binomial_fdr"].lt(alpha) & pooled["wm_log_odds"].gt(0)
     )
-    pooled["pooled_dispersion_adjusted_candidate"] = (
-        pooled["pooled_dispersion_adjusted_fdr"].lt(alpha)
-        & pooled["wm_log_odds"].gt(0)
-    )
     pooled = pooled.sort_values(
-        ["pooled_dispersion_adjusted_candidate", "pooled_dispersion_adjusted_fdr",
-         "pooled_binomial_fdr"],
-        ascending=[False, True, True], na_position="last"
+        ["pooled_binomial_candidate", "pooled_binomial_fdr"],
+        ascending=[False, True], na_position="last"
     ).reset_index(drop=True)
     return per_slice, pooled
 
