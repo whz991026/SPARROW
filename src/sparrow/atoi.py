@@ -1805,11 +1805,19 @@ def plot_wm_aware_sv_volcano(
     fdr_col: str = "binomial_fdr_within_slice",
     candidate_col: Optional[str] = "binomial_candidate",
     alpha: float = 0.05,
+    effect_threshold: float = 1.0,
+    max_abs_effect: float = 6.0,
+    exclude_zero_count_boundaries: bool = True,
     label_top_n: int = 8,
     title: str = "WM-aware SV-A-to-I sites",
     figsize=(6.8, 5.2),
 ):
-    """Plot WM enrichment effect size against multiplicity-adjusted significance."""
+    """Plot stable WM effects; boundary/separation estimates are excluded.
+
+    Orange and blue require both FDR < ``alpha`` and absolute log2 odds ratio
+    above ``effect_threshold``. ``candidate_col`` is retained for API
+    compatibility but does not override these explicit volcano thresholds.
+    """
     if wm_results is None or wm_results.empty:
         raise ValueError("wm_results is empty.")
     required = {site_col, effect_col, fdr_col}
@@ -1827,22 +1835,55 @@ def plot_wm_aware_sv_volcano(
     if plot_df.empty:
         raise ValueError("No finite WM effects and FDR values are available to plot.")
 
-    if candidate_col is not None and candidate_col in plot_df.columns:
-        positive = plot_df[candidate_col].fillna(False).astype(bool)
-    else:
-        positive = plot_df[fdr_col].lt(alpha) & plot_df[effect_col].gt(0)
-    negative = plot_df[fdr_col].lt(alpha) & plot_df[effect_col].lt(0)
-    plot_df["wm_positive_significant"] = positive.to_numpy(bool)
-    plot_df["nonwm_positive_significant"] = negative.to_numpy(bool)
+    if effect_threshold <= 0:
+        raise ValueError("effect_threshold must be positive.")
+    if max_abs_effect <= effect_threshold:
+        raise ValueError("max_abs_effect must be greater than effect_threshold.")
+
+    count_columns = ["wm_A", "wm_G", "nonwm_A", "nonwm_G"]
+    present_count_columns = [column for column in count_columns if column in plot_df.columns]
+    zero_boundary = pd.Series(False, index=plot_df.index)
+    if exclude_zero_count_boundaries and present_count_columns:
+        count_frame = plot_df[present_count_columns].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        zero_boundary = count_frame.le(0).any(axis=1)
+    extreme_effect = plot_df[effect_col].abs().gt(float(max_abs_effect))
+    plot_df["zero_count_boundary"] = zero_boundary.to_numpy(bool)
+    plot_df["extreme_effect_boundary"] = extreme_effect.to_numpy(bool)
+    plot_df["volcano_excluded"] = zero_boundary | extreme_effect
+    plot_df["volcano_exclusion_reason"] = ""
+    plot_df.loc[zero_boundary, "volcano_exclusion_reason"] = "zero_A_or_G_count"
+    plot_df.loc[extreme_effect, "volcano_exclusion_reason"] = "absolute_log2OR_above_limit"
+    plot_df.loc[zero_boundary & extreme_effect, "volcano_exclusion_reason"] = (
+        "zero_A_or_G_count;absolute_log2OR_above_limit"
+    )
+
     plot_df["minus_log10_fdr"] = -np.log10(
         plot_df[fdr_col].clip(lower=np.finfo(float).tiny)
     )
+    display_df = plot_df.loc[~plot_df["volcano_excluded"]].copy()
+    if display_df.empty:
+        raise ValueError("All finite WM effects were boundary or extreme estimates.")
+
+    positive = (
+        display_df[fdr_col].lt(alpha)
+        & display_df[effect_col].gt(effect_threshold)
+    )
+    negative = (
+        display_df[fdr_col].lt(alpha)
+        & display_df[effect_col].lt(-effect_threshold)
+    )
+    plot_df["wm_positive_significant"] = False
+    plot_df["nonwm_positive_significant"] = False
+    plot_df.loc[display_df.index, "wm_positive_significant"] = positive.to_numpy(bool)
+    plot_df.loc[display_df.index, "nonwm_positive_significant"] = negative.to_numpy(bool)
 
     fig, ax = plt.subplots(figsize=figsize)
     background = ~(positive | negative)
     ax.scatter(
-        plot_df.loc[background, effect_col],
-        plot_df.loc[background, "minus_log10_fdr"],
+        display_df.loc[background, effect_col],
+        display_df.loc[background, "minus_log10_fdr"],
         s=22,
         color="#bdbdbd",
         alpha=0.65,
@@ -1851,28 +1892,30 @@ def plot_wm_aware_sv_volcano(
     )
     if negative.any():
         ax.scatter(
-            plot_df.loc[negative, effect_col],
-            plot_df.loc[negative, "minus_log10_fdr"],
+            display_df.loc[negative, effect_col],
+            display_df.loc[negative, "minus_log10_fdr"],
             s=30,
             color="#4e79a7",
             alpha=0.88,
             linewidths=0,
-            label="non-WM > WM, FDR < 0.05",
+            label=f"non-WM > WM, FDR < {alpha:g}, log2OR < -{effect_threshold:g}",
         )
     if positive.any():
         ax.scatter(
-            plot_df.loc[positive, effect_col],
-            plot_df.loc[positive, "minus_log10_fdr"],
+            display_df.loc[positive, effect_col],
+            display_df.loc[positive, "minus_log10_fdr"],
             s=34,
             color="#d95f02",
             alpha=0.92,
             linewidths=0,
-            label="WM > non-WM, FDR < 0.05",
+            label=f"WM > non-WM, FDR < {alpha:g}, log2OR > {effect_threshold:g}",
         )
 
-    ax.axvline(0, color="#555555", lw=0.9, ls="--")
+    ax.axvline(-effect_threshold, color="#555555", lw=0.9, ls="--")
+    ax.axvline(effect_threshold, color="#555555", lw=0.9, ls="--")
     ax.axhline(-np.log10(alpha), color="#555555", lw=0.9, ls=":")
-    label_df = plot_df.loc[positive].sort_values(
+    colored = positive | negative
+    label_df = display_df.loc[colored].sort_values(
         [fdr_col, effect_col], ascending=[True, False]
     ).head(int(label_top_n))
     for _, row in label_df.iterrows():
@@ -1882,6 +1925,28 @@ def plot_wm_aware_sv_volcano(
             xytext=(4, 4),
             textcoords="offset points",
             fontsize=8,
+        )
+
+    absolute_effect = display_df[effect_col].abs().to_numpy(float)
+    robust_limit = float(np.nanquantile(absolute_effect, 0.99))
+    robust_limit = min(float(max_abs_effect), robust_limit * 1.05)
+    robust_limit = max(float(effect_threshold) * 1.25, robust_limit)
+    ax.set_xlim(-robust_limit, robust_limit)
+
+    n_zero = int(zero_boundary.sum())
+    n_extreme_only = int((extreme_effect & ~zero_boundary).sum())
+    n_excluded = int(plot_df["volcano_excluded"].sum())
+    if n_excluded:
+        ax.text(
+            0.02,
+            0.98,
+            f"Excluded boundary estimates: {n_excluded}\n"
+            f"zero A/G: {n_zero}; other |log2OR|>{max_abs_effect:g}: {n_extreme_only}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            color="#555555",
         )
     ax.set_xlabel("WM effect (log2 odds ratio)")
     ax.set_ylabel(f"-log10({fdr_col})")
