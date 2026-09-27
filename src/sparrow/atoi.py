@@ -53,11 +53,15 @@ __all__ = [
     "plot_cluster_score_comparison",
     "plot_count_spatial_discovery",
     "plot_cross_sample_r2_decomposition",
+    "plot_cross_sample_site_spatial_ratios",
     "plot_external_overlap_summary",
     "plot_global_atoi_two_r2_donuts",
+    "plot_recurrent_sv_wm_effect_heatmap",
     "plot_residual_progression",
     "plot_three_slice_sv_atoi_upset",
     "plot_top_sv_site_patterns",
+    "plot_wm_aware_sv_spatial_ratios",
+    "plot_wm_aware_sv_volcano",
     "run_core_analysis",
     "run_sv_external_mechanism_overlaps",
     "set_spatial_background",
@@ -1792,6 +1796,390 @@ def analyze_recurrent_sv_wm_binomial(
         ascending=[False, True, True], na_position="last"
     ).reset_index(drop=True)
     return per_slice, pooled
+
+
+def plot_wm_aware_sv_volcano(
+    wm_results: pd.DataFrame,
+    site_col: str = "site",
+    effect_col: str = "wm_log2fc",
+    fdr_col: str = "binomial_fdr_within_slice",
+    candidate_col: Optional[str] = "binomial_candidate",
+    alpha: float = 0.05,
+    label_top_n: int = 8,
+    title: str = "WM-aware SV-A-to-I sites",
+    figsize=(6.8, 5.2),
+):
+    """Plot WM enrichment effect size against multiplicity-adjusted significance."""
+    if wm_results is None or wm_results.empty:
+        raise ValueError("wm_results is empty.")
+    required = {site_col, effect_col, fdr_col}
+    missing = required.difference(wm_results.columns)
+    if missing:
+        raise ValueError(f"wm_results is missing required columns: {sorted(missing)}")
+
+    plot_df = wm_results.copy()
+    plot_df[site_col] = plot_df[site_col].astype(str)
+    plot_df[effect_col] = pd.to_numeric(plot_df[effect_col], errors="coerce")
+    plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
+    plot_df = plot_df.loc[
+        plot_df[effect_col].notna() & plot_df[fdr_col].notna()
+    ].copy()
+    if plot_df.empty:
+        raise ValueError("No finite WM effects and FDR values are available to plot.")
+
+    if candidate_col is not None and candidate_col in plot_df.columns:
+        positive = plot_df[candidate_col].fillna(False).astype(bool)
+    else:
+        positive = plot_df[fdr_col].lt(alpha) & plot_df[effect_col].gt(0)
+    negative = plot_df[fdr_col].lt(alpha) & plot_df[effect_col].lt(0)
+    plot_df["wm_positive_significant"] = positive.to_numpy(bool)
+    plot_df["nonwm_positive_significant"] = negative.to_numpy(bool)
+    plot_df["minus_log10_fdr"] = -np.log10(
+        plot_df[fdr_col].clip(lower=np.finfo(float).tiny)
+    )
+
+    fig, ax = plt.subplots(figsize=figsize)
+    background = ~(positive | negative)
+    ax.scatter(
+        plot_df.loc[background, effect_col],
+        plot_df.loc[background, "minus_log10_fdr"],
+        s=22,
+        color="#bdbdbd",
+        alpha=0.65,
+        linewidths=0,
+        label="Not significant",
+    )
+    if negative.any():
+        ax.scatter(
+            plot_df.loc[negative, effect_col],
+            plot_df.loc[negative, "minus_log10_fdr"],
+            s=30,
+            color="#4e79a7",
+            alpha=0.88,
+            linewidths=0,
+            label="non-WM > WM, FDR < 0.05",
+        )
+    if positive.any():
+        ax.scatter(
+            plot_df.loc[positive, effect_col],
+            plot_df.loc[positive, "minus_log10_fdr"],
+            s=34,
+            color="#d95f02",
+            alpha=0.92,
+            linewidths=0,
+            label="WM > non-WM, FDR < 0.05",
+        )
+
+    ax.axvline(0, color="#555555", lw=0.9, ls="--")
+    ax.axhline(-np.log10(alpha), color="#555555", lw=0.9, ls=":")
+    label_df = plot_df.loc[positive].sort_values(
+        [fdr_col, effect_col], ascending=[True, False]
+    ).head(int(label_top_n))
+    for _, row in label_df.iterrows():
+        ax.annotate(
+            row[site_col],
+            (row[effect_col], row["minus_log10_fdr"]),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=8,
+        )
+    ax.set_xlabel("WM effect (log2 odds ratio)")
+    ax.set_ylabel(f"-log10({fdr_col})")
+    ax.set_title(title)
+    ax.legend(frameon=False, fontsize=8, loc="best")
+    fig.tight_layout()
+    return fig, ax, plot_df
+
+
+def plot_wm_aware_sv_spatial_ratios(
+    adata_ai,
+    wm_results: pd.DataFrame,
+    group_key: str = "ground_truth",
+    site_col: str = "site",
+    effect_col: str = "wm_log2fc",
+    fdr_col: str = "binomial_fdr_within_slice",
+    candidate_col: Optional[str] = "binomial_candidate",
+    alpha: float = 0.05,
+    top_n: int = 3,
+    min_cov: int = 5,
+    mode: str = "cluster",
+    cmap: str = "magma",
+    spot_size: int = 18,
+    title: str = "Top WM-enriched SV-A-to-I spatial ratios",
+    figsize=None,
+):
+    """Plot the top WM-enriched single-site editing ratios with one colorbar per site."""
+    if wm_results is None or wm_results.empty:
+        raise ValueError("wm_results is empty.")
+    required = {site_col, effect_col, fdr_col}
+    missing = required.difference(wm_results.columns)
+    if missing:
+        raise ValueError(f"wm_results is missing required columns: {sorted(missing)}")
+    mode = str(mode).lower()
+    if mode not in {"spot", "cluster"}:
+        raise ValueError("mode must be 'spot' or 'cluster'.")
+
+    selected = wm_results.copy()
+    selected[site_col] = selected[site_col].astype(str)
+    selected[effect_col] = pd.to_numeric(selected[effect_col], errors="coerce")
+    selected[fdr_col] = pd.to_numeric(selected[fdr_col], errors="coerce")
+    if candidate_col is not None and candidate_col in selected.columns:
+        mask = selected[candidate_col].fillna(False).astype(bool)
+    else:
+        mask = selected[fdr_col].lt(alpha) & selected[effect_col].gt(0)
+    selected = selected.loc[mask].sort_values(
+        [fdr_col, effect_col], ascending=[True, False]
+    )
+    selected = selected.loc[selected[site_col].isin(adata_ai.var_names)].head(int(top_n)).copy()
+    if selected.empty:
+        raise ValueError("No significant WM-enriched SV-A-to-I site is available to plot.")
+
+    sites = selected[site_col].tolist()
+    if figsize is None:
+        figsize = (4.25 * len(sites), 4.2)
+    fig, axes = plt.subplots(1, len(sites), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+    labels = _valid_group_series(adata_ai, group_key=group_key) if mode == "cluster" else None
+
+    for ax, (_, row) in zip(axes, selected.iterrows()):
+        site = row[site_col]
+        ratio = get_site_editing_ratio(adata_ai, site, min_cov=min_cov)
+        values = _map_group_mean_to_spots(ratio, labels) if mode == "cluster" else ratio.to_numpy()
+        gene = site
+        if site in adata_ai.var.index and "Gene.refGene" in adata_ai.var.columns:
+            gene = str(adata_ai.var.loc[site].get("Gene.refGene", site))
+        panel_title = (
+            f"{gene}\n{site}\n"
+            f"WM log2OR={row[effect_col]:.2f}; FDR={row[fdr_col]:.2g}"
+        )
+        scatter = _spatial_axes(
+            ax, adata_ai, values, panel_title,
+            cmap=cmap, spot_size=spot_size,
+        )
+        if scatter is not None:
+            colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.02)
+            colorbar.set_label("Editing ratio", fontsize=8)
+
+    fig.suptitle(f"{title} ({mode} level)", y=1.03, fontsize=13)
+    fig.tight_layout()
+    return fig, axes, selected.reset_index(drop=True)
+
+
+def _load_cross_sample_spatial_adata(
+    data_root,
+    sample_id,
+    group_key="ground_truth",
+    swap_x_y=True,
+):
+    """Load one DLPFC A-to-I matrix with labels, full-resolution coordinates and H&E metadata."""
+    import anndata as ad
+    import json
+
+    sample_id = str(sample_id)
+    base = Path(data_root) / sample_id
+    adata = ad.read_h5ad(base / "adata_ai.h5ad")
+    positions = pd.read_csv(
+        base / "spatial" / "tissue_positions_list.csv",
+        header=None,
+        names=["barcode", "in_tissue", "x_array", "y_array", "x_pixel", "y_pixel"],
+    ).set_index("barcode")
+    aligned = positions.reindex(adata.obs_names)
+    for column in positions.columns:
+        adata.obs[column] = aligned[column].to_numpy()
+    adata.obsm["spatial"] = aligned[["x_pixel", "y_pixel"]].to_numpy(dtype=float)
+
+    labels = pd.read_csv(base / f"cluster_labels_{sample_id}.csv")
+    if "key" not in labels.columns or group_key not in labels.columns:
+        raise ValueError(f"Missing key/{group_key} in cluster labels for {sample_id}.")
+    labels["barcode"] = labels["key"].astype(str).str.split("_", n=1).str[-1]
+    adata.obs[group_key] = labels.set_index("barcode")[group_key].reindex(
+        adata.obs_names
+    ).to_numpy()
+    adata.obs[group_key] = adata.obs[group_key].replace(
+        ["nan", "None", "NA", "null", ""], np.nan
+    )
+
+    scale_path = base / "spatial" / "scalefactors_json.json"
+    if scale_path.exists():
+        with scale_path.open("r", encoding="utf-8") as handle:
+            coordinate_scale = float(json.load(handle).get("tissue_hires_scalef", 1.0))
+    else:
+        coordinate_scale = 1.0
+    return set_spatial_background(
+        adata,
+        image_path=str(base / "spatial" / "tissue_hires_image.png"),
+        swap_x_y=bool(swap_x_y),
+        coordinate_scale=coordinate_scale,
+        crop=True,
+        crop_pad=120,
+        image_alpha=0.78,
+    )
+
+
+def plot_cross_sample_site_spatial_ratios(
+    site: str,
+    data_root,
+    sample_ids=("151673", "151671", "151507"),
+    group_key: str = "ground_truth",
+    min_cov: int = 5,
+    mode: str = "cluster",
+    swap_x_y_by_sample=None,
+    cmap: str = "magma",
+    spot_size: int = 18,
+    title: Optional[str] = None,
+    figsize=(12.8, 4.3),
+):
+    """Plot one site across slices, with independent normalization and colorbar per slice."""
+    mode = str(mode).lower()
+    if mode not in {"spot", "cluster"}:
+        raise ValueError("mode must be 'spot' or 'cluster'.")
+    samples = [str(sample) for sample in sample_ids]
+    if swap_x_y_by_sample is None:
+        swap_x_y_by_sample = {sample: True for sample in samples}
+
+    fig, axes = plt.subplots(1, len(samples), figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+    summary_rows = []
+    for ax, sample in zip(axes, samples):
+        swap = (
+            swap_x_y_by_sample.get(sample, False)
+            if isinstance(swap_x_y_by_sample, dict)
+            else bool(swap_x_y_by_sample)
+        )
+        adata = _load_cross_sample_spatial_adata(
+            data_root, sample, group_key=group_key, swap_x_y=swap
+        )
+        if site not in adata.var_names:
+            ax.text(0.5, 0.5, f"{sample}\n{site} absent", ha="center", va="center")
+            ax.axis("off")
+            summary_rows.append({"sample_id": sample, "site": site, "status": "site_absent"})
+            continue
+
+        ratio = get_site_editing_ratio(adata, site, min_cov=min_cov)
+        if mode == "cluster":
+            labels = _valid_group_series(adata, group_key=group_key)
+            values = _map_group_mean_to_spots(ratio, labels)
+            frame = pd.DataFrame({"group": labels, "editing_ratio": ratio}).dropna()
+            grouped = frame.groupby("group", observed=True)["editing_ratio"].agg(["mean", "size"])
+            for group, row in grouped.iterrows():
+                summary_rows.append({
+                    "sample_id": sample, "site": site, "group": group,
+                    "editing_ratio": float(row["mean"]), "n_spots": int(row["size"]),
+                    "status": "ok",
+                })
+        else:
+            values = ratio.to_numpy()
+            summary_rows.append({
+                "sample_id": sample, "site": site,
+                "editing_ratio": float(ratio.mean()),
+                "n_spots": int(ratio.notna().sum()), "status": "ok",
+            })
+
+        scatter = _spatial_axes(
+            ax, adata, values, f"{sample}\n{site}",
+            cmap=cmap, spot_size=spot_size,
+        )
+        if scatter is not None:
+            colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.02)
+            colorbar.set_label("Editing ratio", fontsize=8)
+
+    fig.suptitle(
+        title or f"{site}: spatial editing ratio across three slices ({mode} level)",
+        y=1.03,
+        fontsize=13,
+    )
+    fig.tight_layout()
+    return fig, axes, pd.DataFrame(summary_rows)
+
+
+def plot_recurrent_sv_wm_effect_heatmap(
+    per_slice_results: pd.DataFrame,
+    pooled_results: Optional[pd.DataFrame] = None,
+    sample_order=("151673", "151671", "151507"),
+    site_col: str = "site",
+    sample_col: str = "sample_id",
+    effect_col: str = "wm_log2fc",
+    fdr_col: str = "binomial_fdr_within_slice",
+    pooled_fdr_col: str = "pooled_binomial_fdr",
+    sites: Optional[Sequence[str]] = None,
+    top_n: int = 30,
+    alpha: float = 0.05,
+    title: str = "Recurrent SV-A-to-I WM effects across slices",
+    figsize=None,
+):
+    """Heatmap of slice-specific WM log2 odds ratios; stars mark within-slice FDR < alpha."""
+    if per_slice_results is None or per_slice_results.empty:
+        raise ValueError("per_slice_results is empty.")
+    required = {site_col, sample_col, effect_col, fdr_col}
+    missing = required.difference(per_slice_results.columns)
+    if missing:
+        raise ValueError(f"per_slice_results is missing required columns: {sorted(missing)}")
+    samples = [str(sample) for sample in sample_order]
+
+    if sites is None:
+        if pooled_results is not None and not pooled_results.empty:
+            ranking = pooled_results.copy()
+            ranking[site_col] = ranking[site_col].astype(str)
+            ranking[pooled_fdr_col] = pd.to_numeric(
+                ranking[pooled_fdr_col], errors="coerce"
+            )
+            sites = ranking.sort_values(
+                pooled_fdr_col, na_position="last"
+            )[site_col].head(int(top_n)).tolist()
+        else:
+            sites = per_slice_results[site_col].astype(str).drop_duplicates().head(int(top_n)).tolist()
+    sites = [str(site) for site in sites]
+    if not sites:
+        raise ValueError("No recurrent site is available for the heatmap.")
+
+    frame = per_slice_results.copy()
+    frame[site_col] = frame[site_col].astype(str)
+    frame[sample_col] = frame[sample_col].astype(str)
+    frame = frame.loc[frame[site_col].isin(sites)]
+    effects = frame.pivot_table(
+        index=site_col, columns=sample_col, values=effect_col, aggfunc="first"
+    ).reindex(index=sites, columns=samples)
+    fdr = frame.pivot_table(
+        index=site_col, columns=sample_col, values=fdr_col, aggfunc="first"
+    ).reindex(index=sites, columns=samples)
+    stars = fdr.applymap(lambda value: "*" if pd.notna(value) and value < alpha else "")
+
+    finite = np.abs(effects.to_numpy(dtype=float))
+    finite = finite[np.isfinite(finite)]
+    limit = float(np.quantile(finite, 0.95)) if finite.size else 1.0
+    limit = max(limit, 1.0)
+    if figsize is None:
+        figsize = (5.8, max(4.2, 0.28 * len(sites) + 1.8))
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_facecolor("#eeeeee")
+    sns.heatmap(
+        effects,
+        mask=effects.isna(),
+        cmap="RdBu_r",
+        center=0,
+        vmin=-limit,
+        vmax=limit,
+        annot=stars,
+        fmt="",
+        linewidths=0.35,
+        linecolor="white",
+        cbar_kws={"label": "WM effect (log2 odds ratio)"},
+        ax=ax,
+    )
+    ax.set_xlabel("Slice")
+    ax.set_ylabel("Recurrent SV-A-to-I site")
+    ax.set_title(title)
+    ax.text(
+        0,
+        -0.07,
+        f"* within-slice FDR < {alpha:g}; grey cells lack WM/non-WM support",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    return fig, ax, effects, fdr
 
 
 
