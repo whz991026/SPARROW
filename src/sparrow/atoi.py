@@ -61,7 +61,7 @@ __all__ = [
     "plot_three_slice_sv_atoi_upset",
     "plot_top_sv_site_patterns",
     "plot_wm_aware_sv_spatial_ratios",
-    "plot_wm_aware_sv_volcano",
+    "plot_wm_aware_sv_signed_significance",
     "run_core_analysis",
     "run_sv_external_mechanism_overlaps",
     "set_spatial_background",
@@ -1798,7 +1798,7 @@ def analyze_recurrent_sv_wm_binomial(
     return per_slice, pooled
 
 
-def plot_wm_aware_sv_volcano(
+def plot_wm_aware_sv_signed_significance(
     wm_results: pd.DataFrame,
     site_col: str = "site",
     effect_col: str = "wm_log2fc",
@@ -1814,8 +1814,7 @@ def plot_wm_aware_sv_volcano(
 ):
     """Plot ranked, direction-aware significance for WM-aware SV-A-to-I tests.
 
-    This function keeps its historical name so existing notebooks continue to
-    run, but it no longer draws a volcano plot.  The y coordinate is
+    The y coordinate is
 
     ``sign(wm_log2FC) * -log10(FDR)``.
 
