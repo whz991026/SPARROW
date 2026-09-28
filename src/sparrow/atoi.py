@@ -33,6 +33,7 @@ __all__ = [
     "analyze_recurrent_sv_wm_binomial",
     "analyze_score_vs_celltypes",
     "annotate_sv_atoi_sites",
+    "classify_atoi_annotation",
     "collapse_deconvolution_to_clusters",
     "compute_global_atoi_ratio",
     "compute_multisite_atoi_score",
@@ -46,6 +47,7 @@ __all__ = [
     "install_figure_pdf_export",
     "parse_dlpfc_celltype_group",
     "plot_bivariate_colocalization",
+    "plot_atoi_annotation_distributions",
     "plot_celltype_module_deconvolution_summary",
     "plot_cluster_adar_correlation_heatmap",
     "plot_cluster_level_obs_panel",
@@ -75,6 +77,172 @@ _SPATIAL_IMAGE_CACHE = {}
 
 
 _EXTERNAL_GENE_FILTER_CACHE = {}
+
+
+ANNOTATION_REGION_COLUMN = "Func.refGene"
+REPEAT_ORDER = ["Alu", "Other repeat", "Non-repeat"]
+REGION_ORDER = ["Intronic", "Exonic", "UTR5", "UTR3"]
+REPEAT_COLORS = ["#D97942", "#648BA2", "#C9CDD1"]
+REGION_COLORS = ["#648BA2", "#D97942", "#D8B65B", "#9B83AD"]
+
+
+def _atoi_region_label(value):
+    tokens = set(re.split(r"[;,|]+", str(value).lower().replace(" ", "")))
+    if "utr5" in tokens:
+        return "UTR5"
+    if "utr3" in tokens:
+        return "UTR3"
+    if tokens & {"exonic", "cds", "ncrna_exonic"}:
+        return "Exonic"
+    if tokens & {"intronic", "ncrna_intronic"}:
+        return "Intronic"
+    return "Exonic" if "exon" in str(value).lower() else "Intronic"
+
+
+def classify_atoi_annotation(var, region_col=ANNOTATION_REGION_COLUMN):
+    """Classify unique A-to-I coordinates by repeat and genomic region."""
+    required = {"chr", "pos", "repeat", region_col}
+    if not required.issubset(var.columns):
+        raise ValueError(
+            f"Missing annotation columns: {sorted(required - set(var.columns))}"
+        )
+    table = var.copy()
+    table["site_id"] = table.index.astype(str)
+    chrom = table["chr"].astype(str).str.replace(r"^chr", "", regex=True)
+    pos = pd.to_numeric(table["pos"], errors="raise")
+    invalid_chrom = chrom.isin(["", "nan", "None"])
+    invalid_pos = pos.isna() | (pos < 1) | (pos % 1 != 0)
+    if invalid_chrom.any() or invalid_pos.any():
+        raise ValueError("Invalid 1-based site coordinates.")
+    table["unique_site"] = chrom + ":" + pos.astype("int64").astype(str)
+
+    repeat = table["repeat"].astype("string").str.strip()
+    missing = repeat.isna() | repeat.str.lower().isin(["", "nan", "none", "na", "."])
+    if missing.any():
+        raise ValueError(
+            "Missing repeat annotations; do not treat missing values as non-repeat."
+        )
+    nonrepeat = repeat.str.lower().isin(["-/-", "non-repeat", "nonrepeat"])
+    alu = repeat.str.contains(
+        r"(?:^|[/&;|,])alu[^/&;|,]*", case=False, regex=True, na=False
+    )
+    table["repeat_class"] = np.where(
+        alu, "Alu", np.where(nonrepeat, "Non-repeat", "Other repeat")
+    )
+    table["genomic_region"] = table[region_col].map(_atoi_region_label)
+
+    table["_repeat_rank"] = table["repeat_class"].map(
+        dict(zip(REPEAT_ORDER, range(len(REPEAT_ORDER))))
+    )
+    table["_region_rank"] = table["genomic_region"].map(
+        dict(zip(REGION_ORDER, range(len(REGION_ORDER))))
+    )
+    table = table.sort_values(["_repeat_rank", "_region_rank"], kind="stable")
+    return table.drop_duplicates("unique_site").drop(
+        columns=["_repeat_rank", "_region_rank"]
+    )
+
+
+def plot_atoi_annotation_distributions(
+    before_var,
+    global_var,
+    sample_id,
+    output_dir=None,
+    region_col=ANNOTATION_REGION_COLUMN,
+    save=False,
+):
+    """Plot repeat and genomic-region composition before and after filtering.
+
+    By default this function only displays the four figures and returns the
+    summary table. Set ``save=True`` and provide ``output_dir`` to export the
+    figures and tables.
+    """
+    tables = {
+        "before_filter": classify_atoi_annotation(before_var, region_col),
+        "global": classify_atoi_annotation(global_var, region_col),
+    }
+    if not set(tables["global"]["unique_site"]).issubset(
+        tables["before_filter"]["unique_site"]
+    ):
+        raise ValueError(
+            "Global sites are not a subset of this slice's pre-filter sites. "
+            "Reload the slice."
+        )
+
+    out = None
+    if save:
+        if output_dir is None:
+            raise ValueError("output_dir is required when save=True.")
+        out = Path(output_dir) / str(sample_id)
+        out.mkdir(parents=True, exist_ok=True)
+
+    summaries = []
+    panels = [
+        ("repeat", "repeat_class", REPEAT_ORDER, REPEAT_COLORS),
+        ("region", "genomic_region", REGION_ORDER, REGION_COLORS),
+    ]
+    for stage, table in tables.items():
+        stage_label = "Before filtering" if stage == "before_filter" else "Global A-to-I"
+        if save:
+            table.to_csv(out / f"{sample_id}_{stage}_site_annotations.csv", index=False)
+        for kind, column, order, colors in panels:
+            counts = table[column].value_counts().reindex(order, fill_value=0)
+            total = int(counts.sum())
+            pct = counts / total * 100 if total else counts.astype(float)
+            summaries.append(
+                pd.DataFrame(
+                    {
+                        "sample_id": str(sample_id),
+                        "stage": stage,
+                        "panel": kind,
+                        "category": order,
+                        "n": counts.values,
+                        "denominator": total,
+                        "percent": pct.values,
+                    }
+                )
+            )
+            fig, ax = plt.subplots(figsize=(7.4, 4.8), constrained_layout=True)
+            if total:
+                ax.pie(
+                    counts.values,
+                    colors=colors,
+                    startangle=90,
+                    counterclock=False,
+                    wedgeprops={"width": 0.40, "edgecolor": "white"},
+                )
+            else:
+                ax.text(0.5, 0.75, "No sites", ha="center", transform=ax.transAxes)
+            ax.text(0, 0, f"n = {total:,}", ha="center", va="center", fontsize=12)
+            ax.legend(
+                [Patch(facecolor=color) for color in colors],
+                [
+                    f"{category}: {int(counts[category]):,} ({pct[category]:.1f}%)"
+                    for category in order
+                ],
+                loc="center left",
+                bbox_to_anchor=(1, 0.5),
+                frameon=False,
+            )
+            panel_title = "Repeat composition" if kind == "repeat" else "Genomic region"
+            ax.set_title(f"{sample_id} | {stage_label}\n{panel_title}")
+            if save:
+                for extension in ("pdf", "png"):
+                    fig.savefig(
+                        out / f"{sample_id}_{stage}_{kind}.{extension}",
+                        dpi=300,
+                        bbox_inches="tight",
+                    )
+            plt.show()
+            plt.close(fig)
+
+    summary = pd.concat(summaries, ignore_index=True)
+    if save:
+        summary.to_csv(
+            out / f"{sample_id}_annotation_distribution_summary.csv", index=False
+        )
+        print(f"Saved annotation figures and tables to {out.resolve()}")
+    return summary
 
 QUALITY_PROFILES = {
     'Q20': dict(mapq=20, baseq=20, end_distance=0, unique=False),
@@ -1637,12 +1805,24 @@ def analyze_recurrent_sv_wm_binomial(
             wm_g = float(frame.loc[wm, "G"].sum())
             nonwm_a = float(frame.loc[~wm, "A"].sum())
             nonwm_g = float(frame.loc[~wm, "G"].sum())
+            boundary_counts = {
+                "wm_A": wm_a,
+                "wm_G": wm_g,
+                "nonwm_A": nonwm_a,
+                "nonwm_G": nonwm_g,
+            }
+            zero_count_boundary = any(value == 0 for value in boundary_counts.values())
+            boundary_reason = ",".join(
+                name for name, value in boundary_counts.items() if value == 0
+            )
             sufficient = n_wm >= min_spots_per_group and n_nonwm >= min_spots_per_group
             row = {
                 "site": site, "sample_id": sample,
                 "n_wm_spots": n_wm, "n_nonwm_spots": n_nonwm,
                 "wm_A": wm_a, "wm_G": wm_g,
                 "nonwm_A": nonwm_a, "nonwm_G": nonwm_g,
+                "zero_count_boundary": zero_count_boundary,
+                "boundary_reason": boundary_reason,
                 "support_ok": sufficient, "fit_status": "insufficient_support",
                 "wm_log_odds": np.nan, "wm_log2fc": np.nan,
                 "wm_log2fc_se": np.nan, "wm_log2fc_ci_low": np.nan,
@@ -1745,6 +1925,15 @@ def analyze_recurrent_sv_wm_binomial(
             "heterogeneity_lrt": np.nan, "heterogeneity_df": np.nan,
             "heterogeneity_p": np.nan,
         }
+        pooled_boundary_counts = {
+            name: row[name] for name in ("wm_A", "wm_G", "nonwm_A", "nonwm_G")
+        }
+        row["zero_count_boundary"] = any(
+            value == 0 for value in pooled_boundary_counts.values()
+        )
+        row["boundary_reason"] = ",".join(
+            name for name, value in pooled_boundary_counts.items() if value == 0
+        )
         # A pooled cross-slice effect requires at least two independently
         # eligible slices. Unsupported slices are excluded from the fit rather
         # than merely omitted from the support count.
@@ -1974,6 +2163,7 @@ def plot_wm_aware_sv_spatial_ratios(
     effect_col: str = "wm_log2fc",
     fdr_col: str = "binomial_fdr_within_slice",
     candidate_col: Optional[str] = "binomial_candidate",
+    boundary_col: Optional[str] = "zero_count_boundary",
     alpha: float = 0.05,
     top_n: int = 3,
     min_cov: int = 5,
@@ -1983,7 +2173,7 @@ def plot_wm_aware_sv_spatial_ratios(
     title: str = "Top WM-enriched SV-A-to-I spatial ratios",
     figsize=None,
 ):
-    """Plot the top WM-enriched single-site editing ratios with one colorbar per site."""
+    """Plot top WM-enriched ratios, excluding zero-count boundary fits."""
     if wm_results is None or wm_results.empty:
         raise ValueError("wm_results is empty.")
     required = {site_col, effect_col, fdr_col}
@@ -2002,12 +2192,16 @@ def plot_wm_aware_sv_spatial_ratios(
         mask = selected[candidate_col].fillna(False).astype(bool)
     else:
         mask = selected[fdr_col].lt(alpha) & selected[effect_col].gt(0)
+    if boundary_col is not None and boundary_col in selected.columns:
+        mask &= ~selected[boundary_col].fillna(False).astype(bool)
     selected = selected.loc[mask].sort_values(
         [fdr_col, effect_col], ascending=[True, False]
     )
     selected = selected.loc[selected[site_col].isin(adata_ai.var_names)].head(int(top_n)).copy()
     if selected.empty:
-        raise ValueError("No significant WM-enriched SV-A-to-I site is available to plot.")
+        raise ValueError(
+            "No significant non-boundary WM-enriched SV-A-to-I site is available to plot."
+        )
 
     sites = selected[site_col].tolist()
     if figsize is None:
@@ -3900,12 +4094,30 @@ def add_gene_expression_to_obs(
     genes=("ADAR", "ADARB1", "ADARB2"),
     prefix="expr_",
     layer=None,
+    normalize_total: bool = False,
+    target_sum: float = 1e4,
     log1p: bool = False,
 ):
     """
-    Copy selected gene expression columns from expression AnnData into target AnnData obs.
+    Copy selected gene-expression columns into ``target_adata.obs``.
+
+    When ``normalize_total=True``, values are converted to counts per
+    ``target_sum`` using each spot's total expression in the selected matrix.
+    ``log1p=True`` is then applied after normalization. The source AnnData is
+    not modified.
     """
     common = target_adata.obs_names.intersection(adata_expr.obs_names)
+
+    expression = adata_expr[common].layers[layer] if layer is not None else adata_expr[common].X
+    scale = None
+    if normalize_total:
+        totals = np.asarray(expression.sum(axis=1)).ravel().astype(float)
+        scale = np.divide(
+            float(target_sum),
+            totals,
+            out=np.zeros_like(totals, dtype=float),
+            where=totals > 0,
+        )
 
     added = []
 
@@ -3918,6 +4130,9 @@ def add_gene_expression_to_obs(
 
         values = x.toarray().ravel() if hasattr(x, "toarray") else np.asarray(x).ravel()
         values = values.astype(float)
+
+        if scale is not None:
+            values = values * scale
 
         if log1p:
             values = np.log1p(values)
